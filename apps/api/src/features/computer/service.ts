@@ -1,8 +1,11 @@
 // `computer.*` for Muses whose Computer the engine owns (docs/adr/0004-engine-owns-the-computer.md).
 // Superchat's API asks the engine which Computer, its screen and who controls it, and relays the screen
 // stream through its same-origin proxy. It keeps no Computer state: no providerRef, no lease row.
+
+import { ORPCError } from "@orpc/server";
 import {
   getOmnigentComputer,
+  getOmnigentSession,
   type OmnigentClientConfig,
   openOmnigentComputerScreen,
   releaseOmnigentComputer,
@@ -10,7 +13,6 @@ import {
 import type { Actor, ComputerStatus } from "@superchat/contracts";
 import { ENGINE_COMPUTER_ID, SCREEN_PROXY_TTL_MS } from "@superchat/core/node/screen-capability";
 import type { PrismaClient } from "@superchat/db";
-import { ORPCError } from "@orpc/server";
 import {
   type EngineComputer,
   engineComputerClient,
@@ -40,15 +42,19 @@ export async function engineComputerStatus(
   const { available, in_control, ready, launch } = await state(
     await resolveEngineComputer(deps, client, actor, botId),
   );
+  // Running means the Conversation's runner is bound and connected (`ready`), with or without a
+  // screen (`available`): a connected host or a Computer without a desktop is not "Sleeping".
+  const running = available || ready === true;
   const status = toComputerStatus(botId, {
     kind: "docker",
-    state: available ? "running" : "stopped",
+    state: running ? "running" : "stopped",
     scope: "dedicated",
     controlHolder: in_control ? "user" : "none",
     controlBotId: in_control ? botId : null,
     homeRevision: "",
   });
-  const withReady = available && ready !== undefined ? { ...status, runnerReady: ready } : status;
+  const screened = { ...status, screenAvailable: available && status.screenAvailable };
+  const withReady = running && ready !== undefined ? { ...screened, runnerReady: ready } : screened;
   const stage = launch?.stage;
   return stage && stage !== "ready" && LAUNCH_STAGES.has(stage)
     ? { ...withReady, launch: { stage: stage as NonNullable<ComputerStatus["launch"]>["stage"] } }
@@ -98,7 +104,9 @@ export async function engineComputerTakeover(
 ): Promise<{ leaseId: string; expiresAt: string }> {
   const target = await resolveEngineComputer(deps, client, actor, botId);
   if (!target.sessionId || !(await state(target)).available) {
-    throw new ORPCError("BAD_REQUEST", { message: "Superchat's computer starts when Superchat needs it" });
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Superchat's computer starts when Superchat needs it",
+    });
   }
   await openOmnigentComputerScreen(client, target.email, target.sessionId, true);
   return {
@@ -126,4 +134,34 @@ export async function withEngineComputer<
   if (!client || !snapshot.botId || !snapshot.computer) return snapshot;
   const computer = await engineComputerStatus(deps, client, actor, snapshot.botId);
   return { ...snapshot, computer };
+}
+
+/** The built-in agent bundles Superchat runs the Muse on, and the harness each runs. */
+const BUNDLE_HARNESS: Record<string, string> = {
+  "superchat-claude": "claude-sdk",
+  "superchat-pi": "pi",
+};
+
+/** Where the Muse's Conversation runs: the engine session's host and its agent bundle. */
+export async function engineComputerHost(
+  deps: EngineComputerDeps,
+  client: OmnigentClientConfig,
+  actor: Actor,
+  botId: string,
+): Promise<{ hostId: string | null; agentName: string | null; harness: string | null }> {
+  const target = await resolveEngineComputer(deps, client, actor, botId);
+  if (!target.sessionId) return { hostId: null, agentName: null, harness: null };
+  const [snapshot, row] = await Promise.all([
+    getOmnigentSession(client, target.email, target.sessionId).catch(() => null),
+    deps.prisma.omnigentSession.findUnique({
+      where: { botId },
+      select: { agentName: true },
+    }),
+  ]);
+  const agentName = row?.agentName ?? null;
+  return {
+    hostId: snapshot?.host_id ?? null,
+    agentName,
+    harness: (agentName && BUNDLE_HARNESS[agentName]) || null,
+  };
 }
