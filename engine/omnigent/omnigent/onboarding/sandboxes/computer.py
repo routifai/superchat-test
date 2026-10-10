@@ -1,0 +1,531 @@
+"""
+Superchat "computer" sandbox launcher.
+
+Runs an Omnigent managed host inside a Muse's own per-Muse sandbox computer — Superchat's
+persistent, shared compute for one Muse (bot), managed by Superchat's own
+``infra/sandboxes/supervisor`` service (a small HTTP API in front of Docker; see
+``infra/sandboxes/computer`` for the image). This is the "computer" runner location
+(docs/omnigent-spike.md): Omnigent runners execute inside the Muse's own sandbox, not on the
+Omnigent server and not on the host machine running it.
+
+Implements :class:`~omnigent.onboarding.sandboxes.base.SandboxHostLauncher` (via
+:class:`~omnigent.onboarding.sandboxes.base.ExecModelHostLauncher`, whose default
+:meth:`~omnigent.onboarding.sandboxes.base.ExecModelHostLauncher.start_host` composes ``run`` /
+``run_background`` into the full host launch) exactly like every other managed-sandbox provider
+(Modal, Boxlite, …) — ``managed_launch`` only; no CLI-bootstrap primitives (``put`` /
+``stream_exec`` / ``exec_foreground`` stay the raising defaults).
+
+Identity: unlike every other provider, this launcher's sandbox is not a fresh box it creates —
+it is a PRE-EXISTING, Superchat-owned resource keyed by the session's Muse, not by the launch-chosen
+``name`` :meth:`SandboxHostLauncher.provision` normally receives. Superchat's gateway stamps every
+Omnigent session with ``omnigent.computer.key`` / ``omnigent.computer.owner`` /
+``omnigent.tenant`` labels (the older ``superchat.computer`` / ``superchat.bot`` / ``superchat.space`` labels
+are still read, deprecated, removal in 0.19); :meth:`prepare_for_launch` is the extension point
+:mod:`omnigent.server.managed_hosts` already threads a first launch's session labels through, and
+this launcher reads the key and tenant labels off them. A RELAUNCH (existing host, fresh
+sandbox generation — see :func:`omnigent.server.managed_hosts.relaunch_managed_host`) has no
+session labels handy, so it instead passes ``previous_sandbox_id`` — this launcher's own encoded
+:meth:`provision` return value from the earlier launch — and recovers the same identity from it.
+
+Sandbox id shape: ``"<bot_id>:<space_id>:<container_id>"``. The first two segments are the
+Muse's identity (recoverable on relaunch, see above); the third is Superchat supervisor's own
+container id, needed by every ``/computers/{id}/...`` call after ``provision``.
+
+Authentication, both directions:
+
+- Omnigent → Superchat's supervisor: a static bearer (``OMNIGENT_COMPUTER_SUPERVISOR_TOKEN``) plus the
+  ``x-superchat-bot-id`` / ``x-superchat-space-id`` identity headers the supervisor cross-checks against
+  the container it resolves — the same shared-secret posture
+  ``packages/adapters/src/docker-sandbox.ts`` already uses from Superchat's own API process
+  (``resolveSupervisorToken`` / ``SANDBOX_SUPERVISOR_TOKEN``). Never a per-user secret: the
+  supervisor has no concept of an Omnigent session owner, only a Muse.
+- The runner → Omnigent server: the STANDARD managed-host launch token
+  (:data:`~omnigent.host.identity.HOST_TOKEN_ENV_VAR`, minted per launch by
+  :mod:`omnigent.server.managed_hosts` and registered against this session's owner in
+  :class:`~omnigent.stores.host_store.HostStore`) — the same short-lived, owner-scoped,
+  per-launch credential every managed provider's host already dials back with. This launcher
+  adds nothing here: ``start_host``'s inherited default already injects it, and it is exactly
+  "never a long-lived admin secret, minted for the session owner."
+
+Stale container id: the supervisor may RECREATE a Muse's container (new id) when the image or
+user changed, so the id inside a stored sandbox id can go stale. Every ``/computers/{id}/...``
+call therefore falls back to re-calling the idempotent ``POST /computers`` (keyed by Muse
+identity) on 404 / "No such container" and retries once with the live id.
+
+Screen: the Muse's screen is the supervisor's per-screen-id display, with a stable screen id
+(the bot id) so the same display is always used. :meth:`provision`-time launches resolve that
+display and hand it to the runner as ``DISPLAY`` (see :meth:`start_host`), so the viewer and the
+Muse's own GUI tools see the same desktop. :meth:`screen_url` / :meth:`release_control` expose
+view and take-over access.
+
+Idempotent: :meth:`provision` calls Superchat supervisor's ``POST /computers``, which itself is an
+ensure-or-create (returns the already-running container, starting it back up if merely stopped,
+rather than replacing it) — repeated launches for the same Muse reuse the same computer without
+this launcher needing its own liveness bookkeeping. ``start_host``'s ``run_background`` wraps the
+host process in the shared restart-on-crash supervisor loop
+(:func:`~omnigent.onboarding.sandboxes.base.supervise_host_command`), so a crashed host process
+self-heals inside the SAME container without a fresh launch at all.
+
+Deliberately does NOT implement
+:meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.terminate` (nor
+:meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.keep_alive`): the computer belongs
+to Superchat and outlives any one Omnigent session (skills, canvas, and browser use share it too) —
+Omnigent's best-effort sandbox cleanup (a session deleted mid-provision, the managed sandbox
+reaper) must never destroy it. The base class's capability-error default is exactly "this
+provider can't do that" from Omnigent's side, which every caller already treats as
+best-effort/skippable.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import TYPE_CHECKING, Any, ClassVar
+from urllib.parse import quote
+
+import click
+import httpx
+
+from omnigent.onboarding.sandboxes.base import (
+    ExecModelHostLauncher,
+    RemoteCommandResult,
+    supervised_host_pidfile_path,
+)
+from omnigent.onboarding.sandboxes.recording import RecordingMixin
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities, SandboxError
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+_logger = logging.getLogger(__name__)
+
+SUPERVISOR_URL_ENV_VAR: str = "OMNIGENT_COMPUTER_SUPERVISOR_URL"
+"""Base URL of the computer supervisor, e.g. ``"http://sandbox-supervisor:7091"``."""
+
+SUPERVISOR_TOKEN_ENV_VAR: str = "OMNIGENT_COMPUTER_SUPERVISOR_TOKEN"
+"""Shared bearer the supervisor expects on every request. Never a per-user credential."""
+
+HOME_ROOT_ENV_VAR: str = "OMNIGENT_COMPUTER_HOME_ROOT"
+"""Root directory a computer's persistent home lives under, joined as ``<root>/homes/<key>``.
+It must resolve to the same host path the supervisor's client uses. Defaults to ``"./data"``."""
+
+LABEL_COMPUTER_KEY: str = "omnigent.computer.key"
+"""Session label naming the computer to run in (shared by every session with the same key)."""
+
+LABEL_COMPUTER_OWNER: str = "omnigent.computer.owner"
+"""Session label naming the computer's owner; used as the key when no key label is set."""
+
+LABEL_TENANT: str = "omnigent.tenant"
+"""Session label naming the tenant (space) the computer belongs to."""
+
+# Deprecated names, read as a fallback so existing deployments keep working.
+# Deprecated in 0.17: remove in 0.19 once clients send the ``omnigent.*`` labels and the
+# ``OMNIGENT_COMPUTER_*`` settings.
+_DEPRECATED_SUPERVISOR_URL_ENV_VAR: str = "OMNIGENT_SUPERCHAT_SUPERVISOR_URL"
+_DEPRECATED_SUPERVISOR_TOKEN_ENV_VAR: str = "OMNIGENT_SUPERCHAT_SUPERVISOR_TOKEN"
+_DEPRECATED_HOME_ROOT_ENV_VAR: str = "OMNIGENT_SUPERCHAT_HOME_ROOT"
+_DEPRECATED_LABEL_COMPUTER_KEY: str = "superchat.computer"
+_DEPRECATED_LABEL_COMPUTER_OWNER: str = "superchat.bot"
+_DEPRECATED_LABEL_TENANT: str = "superchat.space"
+
+
+def tenant_from_labels(labels: Mapping[str, str]) -> str | None:
+    """The tenant a session's labels place its computer in (deprecated label as fallback)."""
+    return labels.get(LABEL_TENANT) or labels.get(_DEPRECATED_LABEL_TENANT) or None
+
+
+def _env_with_fallback(name: str, deprecated_name: str) -> str:
+    """Read *name*, falling back to the deprecated *deprecated_name* (warns once per use)."""
+    value = os.environ.get(name)
+    if value is not None and value != "":
+        return value
+    old = os.environ.get(deprecated_name, "")
+    if old:
+        _logger.warning(
+            "%s is deprecated (removal in 0.19); use %s instead", deprecated_name, name
+        )
+    return old
+
+
+_DEFAULT_HOME_ROOT: str = "./data"
+
+_FALLBACK_DISPLAY: str = ":1"
+"""Display the supervisor assigns the first screen of a computer; used only when an older
+supervisor does not echo ``display`` back from ``screen-mode``."""
+
+_REQUEST_TIMEOUT_S: float = 30.0
+_PROVISION_TIMEOUT_S: float = 120.0
+_EXEC_TIMEOUT_S: float = 300.0
+_EXEC_TIMEOUT_MS: int = int(_EXEC_TIMEOUT_S * 1000)
+
+# Response bodies are echoed into ClickException messages; capped so a misbehaving supervisor
+# (or an accidental HTML error page) can't flood the CLI/log with megabytes of text.
+_MAX_ERROR_BODY_CHARS: int = 500
+
+
+class ComputerSandboxError(SandboxError):
+    """A call to Superchat's sandbox supervisor failed."""
+
+
+def _parse_sandbox_id(sandbox_id: str) -> tuple[str, str, str]:
+    """
+    Split a launcher-issued sandbox id into ``(bot_id, space_id, container_id)``.
+
+    :param sandbox_id: A value :meth:`ComputerSandboxLauncher.provision` returned, e.g.
+        ``"bot_abc:space_xyz:a1b2c3d4e5f6"``.
+    :returns: The three segments, in order.
+    :raises click.ClickException: When *sandbox_id* is not exactly three colon-joined segments —
+        it was not issued by this launcher (or is corrupted).
+    """
+    parts = sandbox_id.split(":", 2)
+    if len(parts) != 3 or not all(parts):
+        raise click.ClickException(
+            f"malformed 'computer' sandbox id {sandbox_id!r} — expected "
+            "'<bot_id>:<space_id>:<container_id>'"
+        )
+    bot_id, space_id, container_id = parts
+    return bot_id, space_id, container_id
+
+
+class ComputerSandboxLauncher(RecordingMixin, ExecModelHostLauncher):
+    """
+    Sandbox launcher that runs Omnigent hosts inside a Muse's Superchat computer.
+
+    See the module docstring for the full design. Registered as the ``"computer"`` sandbox
+    provider (:mod:`omnigent.onboarding.sandboxes.registry`); select it with
+    ``sandbox.provider: computer`` (or in a ``sandbox.providers` list) in the server config —
+    it needs no ``sandbox.computer:`` block, only the two environment variables above, mirroring
+    how the Modal launcher reads ``MODAL_TOKEN_ID``/``MODAL_TOKEN_SECRET`` from the process
+    environment rather than server YAML.
+    """
+
+    provider: ClassVar[str] = "computer"
+    supports_cli_bootstrap: ClassVar[bool] = False
+    supports_managed_launch: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        *,
+        supervisor_url: str | None = None,
+        supervisor_token: str | None = None,
+        home_root: str | None = None,
+        client: httpx.Client | None = None,
+    ) -> None:
+        """
+        :param supervisor_url: Override for :data:`SUPERVISOR_URL_ENV_VAR` (tests / embedding
+            deployments that construct this launcher directly instead of through server YAML).
+        :param supervisor_token: Override for :data:`SUPERVISOR_TOKEN_ENV_VAR`.
+        :param home_root: Override for :data:`HOME_ROOT_ENV_VAR`.
+        :param client: Pre-built HTTP client, e.g. one wired to a fake supervisor via
+            ``httpx.MockTransport`` in tests. ``None`` builds a real client against
+            *supervisor_url* lazily on first use.
+        """
+        self._supervisor_url = (
+            supervisor_url
+            if supervisor_url is not None
+            else _env_with_fallback(SUPERVISOR_URL_ENV_VAR, _DEPRECATED_SUPERVISOR_URL_ENV_VAR)
+        ).rstrip("/")
+        self._supervisor_token = (
+            supervisor_token
+            if supervisor_token is not None
+            else _env_with_fallback(SUPERVISOR_TOKEN_ENV_VAR, _DEPRECATED_SUPERVISOR_TOKEN_ENV_VAR)
+        )
+        self._home_root = (
+            home_root
+            if home_root is not None
+            else _env_with_fallback(HOME_ROOT_ENV_VAR, _DEPRECATED_HOME_ROOT_ENV_VAR)
+        ) or _DEFAULT_HOME_ROOT
+        self._injected_client = client
+        # Set by prepare_for_launch before provision() needs them; provision() is the only
+        # method that relies on this instance state (every other method re-derives identity
+        # from the sandbox_id it is handed, so it works even if called on a fresh instance).
+        self._bot_id: str | None = None
+        self._space_id: str | None = None
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(managed_launch=True, screen=False, recording=False)
+
+    def prepare_for_launch(
+        self,
+        *,
+        agent_name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        previous_sandbox_id: str | None = None,
+    ) -> None:
+        """
+        Resolve this launch's target Muse from session labels, or a relaunch's prior sandbox id.
+
+        A first launch supplies *labels* (``omnigent.computer.key`` / ``omnigent.tenant``, see the
+        module docstring); a relaunch of an existing host supplies *previous_sandbox_id* instead
+        (no session labels are threaded to that path). *labels* wins when both are present, since
+        it reflects the CURRENT session row rather than whatever an earlier launch encoded.
+        Neither resolving leaves identity unset — :meth:`prepare` then fails loud rather than
+        :meth:`provision` doing so with a less legible error.
+
+        :param agent_name: Unused — this provider does not classify runners by agent.
+        :param labels: The launching session's labels, or ``None``.
+        :param previous_sandbox_id: The host's previous :meth:`provision` return value, on a
+            relaunch, or ``None`` for a first launch.
+        """
+        del agent_name
+        found = labels or {}
+        bot_id = (
+            found.get(LABEL_COMPUTER_KEY)
+            or found.get(LABEL_COMPUTER_OWNER)
+            or found.get(_DEPRECATED_LABEL_COMPUTER_KEY)
+            or found.get(_DEPRECATED_LABEL_COMPUTER_OWNER)
+        )
+        space_id = found.get(LABEL_TENANT) or found.get(_DEPRECATED_LABEL_TENANT)
+        if bot_id and space_id:
+            self._bot_id, self._space_id = bot_id, space_id
+            return
+        if previous_sandbox_id:
+            self._bot_id, self._space_id, _container_id = _parse_sandbox_id(previous_sandbox_id)
+
+    def prepare(self) -> None:
+        if not self._supervisor_url:
+            raise click.ClickException(
+                f"{SUPERVISOR_URL_ENV_VAR} is not set — the 'computer' sandbox provider needs "
+                "the computer supervisor URL"
+            )
+        if not self._supervisor_token:
+            raise click.ClickException(
+                f"{SUPERVISOR_TOKEN_ENV_VAR} is not set — the 'computer' sandbox provider needs "
+                "the shared secret the computer supervisor expects on every request"
+            )
+        if not self._bot_id or not self._space_id:
+            raise click.ClickException(
+                "the 'computer' sandbox provider could not resolve this computer's identity — the "
+                f"launching session must carry '{LABEL_COMPUTER_KEY}' "
+                f"(or '{LABEL_COMPUTER_OWNER}') and '{LABEL_TENANT}' labels"
+            )
+
+    def _client(self) -> httpx.Client:
+        if self._injected_client is not None:
+            return self._injected_client
+        # Built lazily (not in __init__): the registry factory constructs one launcher per
+        # launch attempt regardless of whether it ever calls out, matching every other
+        # provider's lazy-SDK-import posture.
+        self._injected_client = httpx.Client(base_url=self._supervisor_url)
+        return self._injected_client
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        bot_id: str,
+        space_id: str,
+        screen: bool = False,
+        **kwargs: object,
+    ) -> httpx.Response:
+        headers = {
+            "authorization": f"Bearer {self._supervisor_token}",
+            "x-superchat-bot-id": bot_id,
+            "x-superchat-space-id": space_id,
+        }
+        if screen:
+            # One stable screen per Muse, so the viewer and the runner share one display.
+            headers["x-superchat-screen-id"] = bot_id
+        kwargs.setdefault("timeout", _REQUEST_TIMEOUT_S)
+        try:
+            return self._client().request(method, path, headers=headers, **kwargs)
+        except httpx.HTTPError as exc:
+            raise click.ClickException(
+                f"Superchat sandbox supervisor request failed ({method} {path}): {exc}"
+            ) from exc
+
+    @staticmethod
+    def _error_detail(response: httpx.Response) -> str:
+        try:
+            return response.text[:_MAX_ERROR_BODY_CHARS]
+        except Exception:
+            # Best-effort error text for a ClickException message; never worth failing over.
+            return ""
+
+    def _ensure_container_id(self, bot_id: str, space_id: str) -> str:
+        """Ensure-or-create the Muse's computer (``POST /computers``) and return its live id."""
+        home_path = os.path.join(self._home_root, "homes", bot_id)
+        response = self._request(
+            "POST",
+            "/computers",
+            bot_id=bot_id,
+            space_id=space_id,
+            json={"botId": bot_id, "homePath": home_path, "spaceId": space_id},
+            timeout=_PROVISION_TIMEOUT_S,
+        )
+        if response.status_code >= 400:
+            raise click.ClickException(
+                "Superchat sandbox supervisor could not ensure this Muse's computer "
+                f"({response.status_code}): {self._error_detail(response)}"
+            )
+        container_id = response.json().get("id")
+        if not isinstance(container_id, str) or not container_id:
+            raise click.ClickException(
+                "Superchat sandbox supervisor's computer response carried no container id"
+            )
+        return container_id
+
+    def _computer_request(
+        self, method: str, sandbox_id: str, suffix: str = "", **kwargs: Any
+    ) -> httpx.Response:
+        """
+        Call ``/computers/{container_id}{suffix}``, re-resolving a stale container id once.
+
+        When the supervisor answers 404 / "No such container" (it recreated the container),
+        re-ensures the computer by Muse identity and retries with the live id.
+        """
+        bot_id, space_id, container_id = _parse_sandbox_id(sandbox_id)
+        path = f"/computers/{quote(container_id, safe='')}{suffix}"
+        response = self._request(method, path, bot_id=bot_id, space_id=space_id, **kwargs)
+        if response.status_code == 404 or "No such container" in self._error_detail(response):
+            live_id = self._ensure_container_id(bot_id, space_id)
+            if live_id != container_id:
+                path = f"/computers/{quote(live_id, safe='')}{suffix}"
+                response = self._request(method, path, bot_id=bot_id, space_id=space_id, **kwargs)
+        return response
+
+    def provision(self, name: str) -> str:
+        """
+        Ensure this Muse's computer is running and return its encoded sandbox id.
+
+        :param name: Unused — Superchat's supervisor keys containers by ``(botId, spaceId)``, not by
+            the launch-chosen human label every other provider uses.
+        """
+        del name
+        if not self._bot_id or not self._space_id:
+            # prepare() already enforces this before provision() ever runs; guards mypy/pyrefly
+            # narrowing below rather than signaling a real reachable state.
+            raise click.ClickException("the 'computer' sandbox provider has no Muse identity")
+        container_id = self._ensure_container_id(self._bot_id, self._space_id)
+        return f"{self._bot_id}:{self._space_id}:{container_id}"
+
+    def run(
+        self,
+        sandbox_id: str,
+        command: str,
+        *,
+        check: bool = True,
+        env: Mapping[str, str] | None = None,
+    ) -> RemoteCommandResult:
+        payload: dict[str, object] = {"argv": ["sh", "-c", command], "timeoutMs": _EXEC_TIMEOUT_MS}
+        if env:
+            # A separate field, never in `command`: values stay out of argv, ps and logs.
+            payload["env"] = dict(env)
+        response = self._computer_request(
+            "POST",
+            sandbox_id,
+            "/exec",
+            json=payload,
+            timeout=_EXEC_TIMEOUT_S + _REQUEST_TIMEOUT_S,
+        )
+        if response.status_code >= 400:
+            result = RemoteCommandResult(
+                returncode=1,
+                stdout="",
+                stderr=f"exec request failed ({response.status_code}): "
+                f"{self._error_detail(response)}",
+            )
+        else:
+            body = response.json()
+            result = RemoteCommandResult(
+                returncode=int(body.get("code", 1)),
+                stdout=str(body.get("stdout") or ""),
+                stderr=str(body.get("stderr") or ""),
+            )
+        if check and result.returncode != 0:
+            raise click.ClickException(
+                f"command failed in Superchat computer (exit {result.returncode}): "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        return result
+
+    def is_running(self, sandbox_id: str) -> bool | None:
+        """Cheap liveness check via ``GET /computers/{id}`` — ``None`` on any request failure
+        (unknown, not a definitive answer), matching the base class's documented contract."""
+        try:
+            response = self._computer_request("GET", sandbox_id)
+        except click.ClickException:
+            return None
+        if response.status_code >= 400:
+            return None
+        try:
+            return bool(response.json().get("running"))
+        except ValueError:
+            return None
+
+    def _screen_mode(self, sandbox_id: str, payload: dict[str, object]) -> dict[str, Any]:
+        """``POST /computers/{id}/screen-mode`` on the Muse's stable screen; returns the body."""
+        response = self._computer_request(
+            "POST", sandbox_id, "/screen-mode", screen=True, json=payload
+        )
+        if response.status_code >= 400:
+            raise click.ClickException(
+                f"Superchat computer screen request failed ({response.status_code}): "
+                f"{self._error_detail(response)}"
+            )
+        body = response.json()
+        return body if isinstance(body, dict) else {}
+
+    def is_host_supervisor_running(self, sandbox_id: str, host_id: str) -> bool:
+        """
+        Whether the supervised host loop for *host_id* is alive in the Computer.
+
+        Stricter than the base check. The Computer's ``$HOME`` is a persistent volume, so the
+        pidfile survives a container recreate while pids restart from scratch: the recorded pid
+        can then belong to an unrelated process (a short-lived browser, say), and a bare
+        ``kill -0`` would wrongly report the loop as running and skip the launch. A pid counts
+        only when it answers ``kill -0`` AND its ``/proc/<pid>/cmdline`` carries this host's
+        pidfile path, which only the supervise loop's ``sh -c <script>`` argv contains.
+
+        :param sandbox_id: Target Computer.
+        :param host_id: Host id of a prior launch; server-generated, validated here anyway.
+        :returns: ``True`` iff the recorded pid is alive and is this host's supervise loop.
+        """
+        if not host_id.replace("-", "").replace("_", "").isalnum():
+            return False
+        pidfile = supervised_host_pidfile_path(host_id)
+        marker = f"hosts/{host_id}.pid"
+        check = (
+            f"pid=$(cat {pidfile} 2>/dev/null); "
+            'case "$pid" in ""|*[!0-9]*) exit 1;; esac; '
+            'kill -0 "$pid" 2>/dev/null || exit 1; '
+            f"tr '\\0' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null | grep -qF -- '{marker}'"
+        )
+        return self.run(sandbox_id, check, check=False).returncode == 0
+
+    def ensure_display(self, sandbox_id: str) -> str:
+        """
+        Make sure the Muse's screen exists and return its X display, e.g. ``":1"``.
+
+        A view-only ``screen-mode`` call that leaves any current person control untouched.
+        """
+        body = self._screen_mode(sandbox_id, {"interactive": False, "revokeControl": False})
+        display = body.get("display")
+        return display if isinstance(display, str) and display else _FALLBACK_DISPLAY
+
+    def screen_url(
+        self,
+        sandbox_id: str,
+        *,
+        interactive: bool,
+        control_token: str | None = None,
+    ) -> str:
+        """Viewer URL for the Muse's screen; *interactive* needs *control_token*."""
+        if interactive and not control_token:
+            raise click.ClickException("an interactive screen requires a control token")
+        payload: dict[str, object] = {"interactive": interactive}
+        if interactive:
+            payload["controlToken"] = control_token
+        else:
+            # A plain view must not revoke a take-over already in progress.
+            payload["revokeControl"] = False
+        url = self._screen_mode(sandbox_id, payload).get("screenUrl")
+        if not isinstance(url, str) or not url:
+            raise click.ClickException("Superchat sandbox supervisor returned no screen URL")
+        return url
+
+    def release_control(self, sandbox_id: str) -> None:
+        """Revoke interactive access to the Muse's screen (hand the computer back)."""
+        self._screen_mode(sandbox_id, {"interactive": False, "revokeControl": True})

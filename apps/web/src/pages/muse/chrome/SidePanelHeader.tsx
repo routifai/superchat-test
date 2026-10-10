@@ -1,0 +1,42 @@
+import { Trans, useLingui } from "@lingui/react/macro";
+import type { Bot, ComputerStatus } from "@superchat/contracts";
+import { Button } from "@superchat/ui-web";
+import { X } from "lucide-react";
+import type { Dispatch, SetStateAction } from "react";
+import type { Panel } from "./panel";
+
+/** The side panel's title row: what is open and the close button. */
+export function SidePanelHeader({
+  panel,
+  setPanel,
+  active,
+  computer,
+}: {
+  panel: Panel;
+  setPanel: Dispatch<SetStateAction<Panel>>;
+  active: Bot | undefined;
+  computer: ComputerStatus | null;
+}) {
+  const { t } = useLingui();
+  return (
+    <div className="mb-4 flex items-center justify-between">
+      <span className="text-[13.5px] text-muted-foreground">
+        {panel === "settings" ? (
+          <Trans>Settings</Trans>
+        ) : active ? (
+          (computer?.state ?? active.status)
+        ) : (
+          <Trans>Group</Trans>
+        )}
+      </span>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        aria-label={t`Close panel`}
+        onClick={() => setPanel(null)}
+      >
+        <X size={16} strokeWidth={1.8} />
+      </Button>
+    </div>
+  );
+}

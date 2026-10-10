@@ -1,0 +1,189 @@
+"""The single registration seam for a Super Chat primitive.
+
+One folder per primitive under ``omnigent/superchat/<name>/`` exposes a :class:`Feature`; the
+three framework seams iterate :data:`omnigent.superchat.features.FEATURES` instead of growing a
+per-primitive branch each:
+
+* ``tools/manager.py`` registers every feature's label-gated tool defs.
+* ``runner/tool_dispatch.py`` routes a feature tool name to its handler.
+* ``server/app.py`` calls :func:`install_features` (stores + routers) and runs the jobs.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Protocol
+
+from omnigent.context.labels import SUBAGENT_LABEL_KEY, is_superside_chat
+
+if TYPE_CHECKING:
+    import httpx
+    from fastapi import FastAPI
+
+    from omnigent.tools.base import Tool
+
+
+def is_super_chat(labels: Mapping[str, str] | None) -> bool:
+    """True for the top-level Super Chat session itself (never a Helper)."""
+    return is_superside_chat(labels) and SUBAGENT_LABEL_KEY not in (labels or {})
+
+
+def is_helper(labels: Mapping[str, str] | None) -> bool:
+    """True for a Super Chat's Helper (sub-agent session)."""
+    return is_superside_chat(labels) and SUBAGENT_LABEL_KEY in (labels or {})
+
+
+@dataclass(frozen=True)
+class ToolManagerCtx:
+    """What a feature's ``tools`` factory may need from the ToolManager (kept minimal)."""
+
+    spec: Any = None
+
+
+@dataclass(frozen=True)
+class SpawnRequest:
+    """One sub-agent launch a handler asks the runner for (the generic create path).
+
+    :param agent: The declared Sub-agent Type to start.
+    :param task: The brief (the child's first message).
+    :param title: Instance label, or ``None`` to leave naming to the engine.
+    :param model: The ``fast`` / ``strong`` choice.
+    :param reasoning_effort: ``low`` / ``medium`` / ``high``, or ``None`` for the default.
+    :param file_ids: Uploaded file ids to hand to the child.
+    """
+
+    agent: str
+    task: str
+    title: str | None = None
+    model: str = "strong"
+    reasoning_effort: str | None = None
+    file_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SpawnResult:
+    """Outcome of a :class:`SpawnRequest`: the child's id, or why it was refused.
+
+    :param child_id: The started child session (``None`` on refusal).
+    :param error: The runner's refusal reason, without a tool-name prefix.
+    """
+
+    child_id: str | None = None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class SubAgentHost:
+    """What the runner offers a handler that starts sub-agents (built in ``tool_dispatch``).
+
+    :param declared_types: Names of the Sub-agent Types the calling session declares.
+    :param helper_roles: ``{type name: "worker" | "subworker"}`` for Types that declare a Helper
+        role in their ``params.helper_type``; Types without one keep their literal name.
+    :param child_titles: Titles of the caller's existing child sessions.
+    :param spawn: Starts one child through the generic sub-agent create path.
+    :param send: Passes a message to one of the caller's own children whose turn is running
+        (``child id, text``); it reads it at its next step. The child itself refuses it when
+        no turn is running by the time it arrives (``{"error": "not_running"}``), so a send
+        never starts a second task. Returns the generic ``sys_session_send`` output.
+    :param running: ``(child id, title)`` of the caller's children whose turn is running.
+    """
+
+    declared_types: tuple[str, ...]
+    child_titles: Callable[[], Awaitable[list[str]]]
+    spawn: Callable[[SpawnRequest], Awaitable[SpawnResult]]
+    helper_roles: Mapping[str, str] = field(default_factory=dict)
+    send: Callable[[str, str], Awaitable[str]] | None = None
+    running: Callable[[], Awaitable[list[tuple[str, str]]]] | None = None
+
+
+@dataclass(frozen=True)
+class HandlerCtx:
+    """What a runner-side feature handler needs about the call.
+
+    :param tool_name: The tool being called.
+    :param server_client: HTTP client pointed at the Omnigent server (``None`` outside a runner).
+    :param conversation_id: The calling session.
+    :param labels: The calling session's labels, when the dispatcher has them.
+    :param sub_agents: The runner's sub-agent launcher (``None`` outside a runner).
+    """
+
+    tool_name: str
+    server_client: httpx.AsyncClient | None
+    conversation_id: str | None
+    labels: Mapping[str, str] | None = None
+    sub_agents: SubAgentHost | None = None
+
+
+@dataclass(frozen=True)
+class InstallDeps:
+    """Server objects a feature's ``install`` may wire its store and router with."""
+
+    scheduled_task_store: Any
+    conversation_store: Any
+    agent_store: Any
+    permission_store: Any
+    auth_provider: Any
+    agent_cache: Any = None
+    runner_router: Any = None
+    objective_store: Any = None
+
+
+class BackgroundJob(Protocol):
+    """A feature's background worker: started with the app, stopped on shutdown."""
+
+    def start(self) -> Any:
+        """Start the job (may be sync or return an awaitable)."""
+
+    def shutdown(self) -> Any:
+        """Stop the job (may be sync or return an awaitable)."""
+
+
+#: Top-level ``/mcp/execute`` body key the engine's relays set. The runner lets a relay op through
+#: its granted-tool gate only for a call that carries it; a model's tool call never does (the
+#: engine builds that body itself), so an injected model cannot reach a relay op by name.
+RELAY_MARK = "_omnigent_relay"
+
+Handler = Callable[[HandlerCtx, dict[str, Any]], Awaitable[str]]
+ResultListener = Callable[[HandlerCtx, str], None]
+#: ``(server_client, conversation_id) -> blocks`` prepended to a Super Chat turn (never raises).
+TurnPrefix = Callable[["httpx.AsyncClient | None", str], Awaitable[list[str]]]
+#: ``(server_client, conversation_id, texts of the turn's own message) -> blocks`` prepended to the
+#: harness body only, closest to the message (never stored; never raises).
+MessagePrefix = Callable[["httpx.AsyncClient | None", str, Sequence[str]], Awaitable[list[str]]]
+
+
+@dataclass(frozen=True)
+class Feature:
+    """One Super Chat primitive's registration surface.
+
+    :param name: Folder / feature name, e.g. ``"vault"``.
+    :param tools: ``(labels, ctx) -> tool defs`` (label-gated: Super Chat vs Helper).
+    :param handlers: ``tool_name -> async handler`` run on the runner.
+    :param relay_ops: Handler names only the engine's relays call (through the runner's
+        ``/mcp/execute`` with :data:`RELAY_MARK`): never offered to a model, and allowed through
+        the runner's granted-tool gate only for a marked relay call in a Super Chat session.
+    :param on_result: Sees every feature handler's ``(ctx, output)`` after it ran (any feature's
+        tool), so a feature can follow another's results without importing it.
+    :param turn_prefix: Blocks this feature prepends to a Super Chat turn (e.g. one-shot notes),
+        read by ``prompt_prefix`` in feature order; a failure never fails the turn.
+    :param message_prefix: Blocks this feature builds from the turn's own message (the files it
+        attaches), prepended for the model only: they sit closest to the message and are never
+        part of what is stored as the person's words.
+    :param needs_own_turn: Whether a message's text needs a turn of its own to be read whole,
+        e.g. because it attaches a file whose ``message_prefix`` context only a turn start
+        adds; such a message is never steered into a running turn.
+    :param install: Wires stores + routers onto the FastAPI app.
+    :param jobs: Returns background jobs (objects with ``start()`` / ``shutdown()``).
+    """
+
+    name: str
+    tools: Callable[[Mapping[str, str] | None, ToolManagerCtx], list[Tool]]
+    handlers: Mapping[str, Handler] = field(default_factory=dict)
+    relay_ops: frozenset[str] = frozenset()
+    on_result: ResultListener | None = None
+    turn_prefix: TurnPrefix | None = None
+    message_prefix: MessagePrefix | None = None
+    needs_own_turn: Callable[[str], bool] | None = None
+    install: Callable[[FastAPI, InstallDeps], None] | None = None
+    jobs: Callable[[FastAPI], list[BackgroundJob]] | None = None
