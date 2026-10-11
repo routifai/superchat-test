@@ -6,30 +6,10 @@ import { useCallback, useEffect, useId, useState } from "react";
 import { errorText } from "../../lib/error-text";
 import { rpc } from "../../lib/rpc";
 import { SettingsGroup, SettingsRow } from "../../pages/muse/settings/kit";
-import { formatEngineDate } from "./engine-models";
-
-/** The providers a model key can be for; the engine's list, in the order people see them. */
-export const MODEL_PROVIDERS = [
-  { id: "anthropic", label: "Anthropic" },
-  { id: "openrouter", label: "OpenRouter" },
-] as const;
+import { formatEngineDate, useModelProviders } from "./engine-models";
 
 const FIELD =
   "min-w-0 flex-1 rounded-lg bg-muted px-2.5 py-1.5 text-[14px] text-foreground outline-none placeholder:text-ink-3 focus-visible:ring-2 focus-visible:ring-ring";
-
-function api(scope: "user" | "org") {
-  return scope === "org"
-    ? {
-        list: rpc.engineAdmin.connections,
-        connect: rpc.engineAdmin.connect,
-        disconnect: rpc.engineAdmin.disconnect,
-      }
-    : {
-        list: rpc.engineModels.connections,
-        connect: rpc.engineModels.connect,
-        disconnect: rpc.engineModels.disconnect,
-      };
-}
 
 /**
  * A key form: one password field. The engine checks the key with the provider before it keeps
@@ -105,21 +85,19 @@ export function KeyForm({
 }
 
 /**
- * Provider keys, personal (`scope: "user"`) or the organization's (`"org"`, admins). A person
- * with no key of their own who can still use a model is on their organization's: shown as a
- * read-only line (`orgProvides`).
+ * The person's provider keys. A person with no key of their own who can still use a model is on
+ * their organization's: shown as a read-only line (`orgProvides`).
  */
 export function ModelKeys({
-  scope = "user",
   orgProvides = false,
   onChanged,
 }: {
-  scope?: "user" | "org";
   /** The person can run models without a key of their own. */
   orgProvides?: boolean;
   onChanged?: () => void;
 }) {
   const { t, i18n } = useLingui();
+  const providers = useModelProviders();
   const [rows, setRows] = useState<EngineModelConnection[] | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -127,19 +105,19 @@ export function ModelKeys({
 
   const load = useCallback(async () => {
     try {
-      setRows(await api(scope).list());
+      setRows(await rpc.engineModels.connections());
     } catch {
       setRows([]);
     }
-  }, [scope]);
+  }, []);
   useEffect(() => {
     void load();
   }, [load]);
 
-  if (!rows) return null;
+  if (!rows || !providers) return null;
 
   async function save(provider: string, apiKey: string) {
-    await api(scope).connect({ provider, apiKey });
+    await rpc.engineModels.connect({ provider, apiKey });
     setEditing(null);
     await load();
     onChanged?.();
@@ -149,7 +127,7 @@ export function ModelKeys({
     setError(null);
     setRemoving(provider);
     try {
-      await api(scope).disconnect({ provider });
+      await rpc.engineModels.disconnect({ provider });
       await load();
       onChanged?.();
     } catch (err) {
@@ -161,11 +139,9 @@ export function ModelKeys({
 
   const hasOwn = rows.length > 0;
   return (
-    <SettingsGroup
-      title={scope === "org" ? <Trans>Organization keys</Trans> : <Trans>API keys</Trans>}
-    >
-      {MODEL_PROVIDERS.map((provider) => {
-        const row = rows.find((candidate) => candidate.provider === provider.id);
+    <SettingsGroup title={<Trans>API keys</Trans>}>
+      {providers.map((provider) => {
+        const row = rows.find((candidate) => candidate.provider === provider.provider);
         const checked = row ? formatEngineDate(row.validatedAt, i18n.locale) : "";
         const hint = row?.hint ?? "";
         const sub = !row
@@ -176,7 +152,7 @@ export function ModelKeys({
               ? t`••••${hint} · Checked ${checked}`
               : `••••${hint}`;
         return (
-          <div key={provider.id} data-testid={`model-key-${provider.id}`}>
+          <div key={provider.provider} data-testid={`model-key-${provider.provider}`}>
             <SettingsRow
               icon={{ tone: "indigo", glyph: <KeyRound strokeWidth={2.4} /> }}
               label={provider.label}
@@ -188,7 +164,9 @@ export function ModelKeys({
                     <Button
                       size="sm"
                       variant="ghost"
-                      onClick={() => setEditing(editing === provider.id ? null : provider.id)}
+                      onClick={() =>
+                        setEditing(editing === provider.provider ? null : provider.provider)
+                      }
                     >
                       <Trans>Replace</Trans>
                     </Button>
@@ -196,8 +174,8 @@ export function ModelKeys({
                       size="sm"
                       variant="ghost"
                       className="text-destructive"
-                      disabled={removing === provider.id}
-                      onClick={() => void remove(provider.id)}
+                      disabled={removing === provider.provider}
+                      onClick={() => void remove(provider.provider)}
                     >
                       <Trans>Remove</Trans>
                     </Button>
@@ -206,24 +184,26 @@ export function ModelKeys({
                   <Button
                     size="sm"
                     variant="ghost"
-                    onClick={() => setEditing(editing === provider.id ? null : provider.id)}
+                    onClick={() =>
+                      setEditing(editing === provider.provider ? null : provider.provider)
+                    }
                   >
                     <Trans>Add key</Trans>
                   </Button>
                 )}
               </span>
             </SettingsRow>
-            {editing === provider.id ? (
+            {editing === provider.provider ? (
               <KeyForm
                 providerLabel={provider.label}
-                onSave={(apiKey) => save(provider.id, apiKey)}
+                onSave={(apiKey) => save(provider.provider, apiKey)}
                 onCancel={() => setEditing(null)}
               />
             ) : null}
           </div>
         );
       })}
-      {scope === "user" && !hasOwn && orgProvides ? (
+      {!hasOwn && orgProvides ? (
         <SettingsRow
           label={<Trans>Provided by your organization</Trans>}
           icon={{ tone: "gray", glyph: <KeyRound strokeWidth={2.4} /> }}

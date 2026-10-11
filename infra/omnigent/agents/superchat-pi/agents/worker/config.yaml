@@ -15,8 +15,8 @@ params:
 
 skills: none
 # Sub-agent Type: worker. Pi, same engine as the Super Chat (ADR 0001, ADR 0007).
-# No model pinned: the Muse picks `fast` or `strong` per dispatch (engine config maps them), and
-# an unpinned Helper otherwise inherits the Muse's model.
+# No model pinned: the Muse picks `fast` or `strong` per dispatch (the organization picks the model
+# behind each in Settings > Models), and an unpinned Helper otherwise inherits the Muse's model.
 executor:
   type: omnigent
   config:
@@ -39,19 +39,9 @@ os_env:
 max_sessions: 5
 
 tools:
-  builtins:
-    - name: web_search
-      search_provider: tavily
-      api_key: ${TAVILY_API_KEY}
-      max_results: 5
-    - name: web_fetch
-      fetch_provider: tavily
-      api_key: ${TAVILY_API_KEY}
   # The Muse's work toolset. Conversation-only tools (cards, side chats, Goals, scheduling,
   # Ideas, memory writes) stay with the Muse; a worker reads memory and history, never writes it.
   allow:
-    - web_search
-    - web_fetch
     - "sys_os_*"
     - memory_search
     - memory_get

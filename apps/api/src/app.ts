@@ -89,9 +89,9 @@ import { cors } from "hono/cors";
 import { engineComputerClient } from "./engine-client.js";
 import type { AppEnv } from "./env.js";
 import { loadEnv } from "./env.js";
-import { setEngineAccountSuspended } from "./features/admin/service.js";
 import { mountPublishedApps } from "./features/apps/published-apps.js";
 import { mountScreenTarget } from "./features/computer/screen-proxy.js";
+import { setEngineAccountSuspended } from "./features/signups/index.js";
 import { mountLocalSettings } from "./local-settings.js";
 import { createMessagingInboundHandler } from "./messaging-inbound.js";
 import { mountMessagingWebhookRoutes } from "./messaging-webhook.js";
@@ -292,8 +292,6 @@ export async function createApp(
     sandboxOverride ??
     createRunSandbox(env.sandboxProvider, {
       ...sandboxProviderOptionsFromEnv(),
-      supervisorUrl: env.sandboxSupervisorUrl,
-      supervisorToken: env.sandboxSupervisorToken,
       e2bApiKey: env.e2bApiKey,
       daytonaApiKey: env.daytonaApiKey,
       daytonaApiUrl: env.daytonaApiUrl,

@@ -43,6 +43,7 @@ function nextRun(automation: Automation, locale: string | undefined): string {
 }
 
 function lastRun(automation: Automation): string {
+  if (automation.lastRunStatus === "running") return "Running…";
   if (!automation.lastRunAt) return "Never run";
   const when = formatRelativeTime(automation.lastRunAt);
   return automation.lastRunStatus === "failed" ? `Failed ${when}` : `Ran ${when}`;
@@ -119,8 +120,12 @@ function useModelChoices(botId: string) {
         if (cancelled || catalog.status !== "ready") return;
         setChoices({
           models: catalog.models.map((model) => ({ id: model.id, label: model.label })),
+          // Without a pick an automation runs on the person's Light model, like any background
+          // Helper.
           defaultLabel:
-            catalog.models.find((model) => model.id === catalog.defaultModel)?.label ?? null,
+            catalog.models.find(
+              (model) => model.id === (catalog.lightModel ?? catalog.automaticLightModel),
+            )?.label ?? null,
         });
       })
       .catch(() => undefined);
@@ -222,7 +227,7 @@ function NewAutomationForm({
             className={SELECT}
           >
             <NativeSelectOption value="">
-              {choices.defaultLabel ? t`Default · ${choices.defaultLabel}` : t`Default`}
+              {choices.defaultLabel ? t`Light · ${choices.defaultLabel}` : t`Light model`}
             </NativeSelectOption>
             {choices.models.map((choice) => (
               <NativeSelectOption key={choice.id} value={choice.id}>

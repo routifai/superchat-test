@@ -3,10 +3,13 @@
 Layout: ``upstreams`` (the provider registry), ``store`` (SQLAlchemy store, sealed with the vault's
 AES-GCM), ``probe`` (one cheap validation call), ``routes`` (``/v1/me/model-connections`` and
 ``/v1/admin/model-connections``), ``budget``/``budget_routes`` (monthly limits and
-``/v1/me/budget``, ``/v1/admin/budget``), ``org`` (the model overlay and suspensions that the
-``admin`` capability serves), ``spend`` (what a proxied call cost), ``proxy`` (the engine model
-proxy). The key goes in once, is probed, sealed and never shown back; the run path reads it
-server-side through :func:`omnigent.superchat.models.store.resolve_model_connection`.
+``/v1/me/budget``, ``/v1/admin/budget``), ``org`` (account suspensions), ``selection`` (a
+person's catalog and their Default and Light picks), ``tiers`` (how Default and Light resolve),
+``background`` (the model the engine's own background work runs on: the owner's Light),
+``listing`` (what an upstream reports about its models), ``spend`` (what a proxied call cost),
+``proxy`` (the engine model proxy).
+The key goes in once, is probed, sealed and never shown back; the run path reads it server-side
+through :func:`omnigent.superchat.models.store.resolve_model_connection`.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from omnigent.superchat.models.embeddings import (
     ModelEmbeddings,
     get_embeddings,
 )
-from omnigent.superchat.models.org import ModelOrgOverlayStore, Overlay, SuspensionStore
+from omnigent.superchat.models.org import SuspensionStore
 from omnigent.superchat.models.store import SCOPE_USER, ModelConnectionStore
 
 if TYPE_CHECKING:
@@ -55,7 +58,12 @@ def _install(app: FastAPI, deps: InstallDeps) -> None:
     preferences = ModelPreferenceStore(deps.scheduled_task_store.storage_location)
     app.state.model_preference_store = preferences
     app.include_router(
-        create_model_selection_router(preferences, auth_provider=deps.auth_provider),
+        create_model_selection_router(
+            preferences,
+            auth_provider=deps.auth_provider,
+            permission_store=deps.permission_store,
+            conversation_store=deps.conversation_store,
+        ),
         prefix="/v1",
         tags=["model-selection"],
     )
@@ -76,7 +84,6 @@ def _install(app: FastAPI, deps: InstallDeps) -> None:
     )
     from omnigent.superchat.models.org import bind_suspensions
 
-    app.state.model_org_overlay = ModelOrgOverlayStore(deps.scheduled_task_store.storage_location)
     suspensions = SuspensionStore(deps.scheduled_task_store.storage_location)
     app.state.model_suspensions = suspensions
     bind_suspensions(suspensions)
@@ -92,6 +99,11 @@ def _install(app: FastAPI, deps: InstallDeps) -> None:
     from omnigent.superchat.models.rerank import ModelRerank
 
     app.state.model_rerank = ModelRerank(store, app.state.model_embeddings)
+    from omnigent.llms.background import register_background_llm
+    from omnigent.superchat.models.background import BackgroundModels
+
+    app.state.model_background = BackgroundModels(app.state)
+    register_background_llm(app.state.model_background.resolve)
     app.include_router(
         create_model_connection_router(
             store,
@@ -118,8 +130,6 @@ __all__ = [
     "ModelBudgets",
     "ModelConnectionStore",
     "ModelEmbeddings",
-    "ModelOrgOverlayStore",
-    "Overlay",
     "SuspensionStore",
     "budget",
     "get_embeddings",

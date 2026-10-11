@@ -1,0 +1,38 @@
+# Omnigent server config for the Superchat engine (the default template). NON-SECRET: start.sh renders
+# __ENGINE_PUBLIC_URL__ from the ENGINE_PUBLIC_URL variable; ${...} is expanded by the engine.
+#
+# No model is named here. The model pickers list what the Anthropic key serves, and an admin
+# picks the default, fast and strong models in Settings > Models (the engine stores them).
+# Background work (memory upkeep, summaries) runs on the fast model through this same provider.
+sandbox:
+  provider: computer
+  # Where the runner inside each Computer dials back: this service's PUBLIC https URL.
+  server_url: __ENGINE_PUBLIC_URL__
+  # NAMES only. Resolved from this service's environment and handed to each Computer's runner.
+  runner_env:
+    - ANTHROPIC_API_KEY
+    - OPENROUTER_API_KEY
+    - OMNIGENT_BROWSER_BACKEND
+    - OMNIGENT_SUBAGENT_MAX_CONCURRENT
+  host_config:
+    providers:
+      # The operator's Anthropic key for everyone (readable inside the Computer, like any
+      # operator key). To keep keys in the engine, use the BYOK template's model connection.
+      anthropic:
+        kind: gateway
+        display_name: Anthropic
+        anthropic:
+          base_url: https://api.anthropic.com
+          api_key_ref: env:ANTHROPIC_API_KEY
+    inference:
+      harnesses:
+        claude-sdk:
+          provider: anthropic
+        pi:
+          provider: anthropic
+  # The model pickers list what the key serves (GET /v1/models), read server-side.
+  model_discovery:
+    anthropic:
+      base_url: https://api.anthropic.com
+      api_key_ref: env:ANTHROPIC_API_KEY
+      family: anthropic

@@ -5,7 +5,8 @@ made by the Computer through the model proxy; this only answers *which* provider
 the same resolution as a run (the person's own connection, then the organization's, among the
 providers whose upstream speaks Chat Completions) and the same suspension and budget checks. It
 never falls back to an operator key. A cheap model is used on purpose: the rerank reads twenty
-short passages.
+short passages: the owner's Light model, the same one background work runs on. With no usable
+catalog the rerank is skipped (``no_model``), never guessed.
 """
 
 from __future__ import annotations
@@ -16,16 +17,13 @@ from omnigent.superchat.models.embeddings import EmbeddingUnavailable, ModelEmbe
 from omnigent.superchat.models.store import ModelConnectionStore, resolve_model_connection
 from omnigent.superchat.models.upstreams import UPSTREAMS
 
-#: A cheap, fast chat model, spelled the way an any-vendor upstream (OpenRouter) expects it.
-RERANK_MODEL = "openai/gpt-4o-mini"
-#: Providers that serve Chat Completions and any vendor's model, best first.
+#: Providers whose upstream serves Chat Completions (the wire the rerank call uses), best first.
 RERANK_PROVIDERS = tuple(
-    name
-    for name, upstream in UPSTREAMS.items()
-    if "chat" in upstream.wire_apis and upstream.vendors_served == "any"
+    name for name, upstream in UPSTREAMS.items() if "chat" in upstream.wire_apis
 )
 
 REASON_NO_CONNECTION = "no_connection"
+REASON_NO_MODEL = "no_model"
 
 
 class RerankUnavailable(Exception):
@@ -48,14 +46,20 @@ class RerankPlan:
 class ModelRerank:
     """Resolves the connection that reranks for an owner."""
 
-    def __init__(self, connections: ModelConnectionStore, checks: ModelEmbeddings) -> None:
+    def __init__(
+        self,
+        connections: ModelConnectionStore,
+        checks: ModelEmbeddings,
+    ) -> None:
         self._connections = connections
         self._checks = checks
 
-    def plan(self, owner_id: str) -> RerankPlan:
+    def plan(self, owner_id: str, model: str | None) -> RerankPlan:
         """The model *owner_id*'s Computer reranks with through the model proxy.
 
-        :raises RerankUnavailable: suspended, budget used up, or no chat-capable connection.
+        :param model: The owner's Light model, or ``None`` when they have none.
+        :raises RerankUnavailable: suspended, budget used up, no chat-capable connection, or no
+            Light model.
         """
         try:
             self._checks.check(owner_id)
@@ -66,4 +70,6 @@ class ModelRerank:
         )
         if connection is None:
             raise RerankUnavailable(REASON_NO_CONNECTION)
-        return RerankPlan(connection.provider, RERANK_MODEL)
+        if not model:
+            raise RerankUnavailable(REASON_NO_MODEL)
+        return RerankPlan(connection.provider, model)

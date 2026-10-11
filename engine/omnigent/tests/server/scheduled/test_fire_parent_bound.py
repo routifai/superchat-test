@@ -394,12 +394,17 @@ async def _scheduled_model(
     agent_type: str,
     parent_model: str | None,
     monkeypatch: pytest.MonkeyPatch,
-    env: dict[str, str],
+    picks: dict[str, dict[str, str]],
 ) -> str | None:
+    from omnigent.superchat.models import tiers
+
     monkeypatch.setenv("TAVILY_API_KEY", "x")
-    monkeypatch.setenv("SUPERCHAT_CLAUDE_MODEL", "muse-model")
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
+
+    # The owner's Light (fast) and Default (strong) per harness (Settings > Models).
+    async def tier_models(_state: Any, _owner: str | None, harness: str | None) -> dict:
+        return {"fast": None, "strong": None, **picks.get(harness or "", {})}
+
+    monkeypatch.setattr(tiers, "tier_models", tier_models)
     conv_store = _ParentConversationStore(_Parent(model_override=parent_model))
     store = _Store({"task_1": _bound_task(agent_type=agent_type)})
     await _fire(
@@ -413,35 +418,41 @@ async def _scheduled_model(
     return conv_store.created[0]["model_override"]
 
 
-_GLOBAL_CLAUDE_IDS = {
-    "OMNIGENT_HELPER_MODEL_FAST": "claude-haiku-4-5",
-    "OMNIGENT_HELPER_MODEL_STRONG": "claude-sonnet-4-6",
-}
+_CLAUDE_PICKS = {"claude-sdk": {"fast": "claude-haiku-4-5", "strong": "claude-sonnet-4-6"}}
 
 
 @pytest.mark.parametrize("agent_type", ["worker", "goal", "teacher"])
-async def test_scheduled_helper_on_pi_bundle_never_gets_a_global_claude_id(
+async def test_scheduled_helper_on_pi_bundle_never_gets_another_harness_pick(
     agent_type: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model = await _scheduled_model(
-        "superchat-pi", agent_type, "openai/gpt-5.6-luna", monkeypatch, _GLOBAL_CLAUDE_IDS
+        "superchat-pi", agent_type, "openai/gpt-5.6-luna", monkeypatch, _CLAUDE_PICKS
     )
     assert model == "openai/gpt-5.6-luna"
 
 
-async def test_scheduled_helper_on_pi_bundle_uses_the_pi_fast_mapping(
+async def test_scheduled_helper_on_pi_bundle_uses_the_pi_fast_pick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    env = {**_GLOBAL_CLAUDE_IDS, "OMNIGENT_HELPER_MODEL_FAST_PI": "openai/gpt-5.6-mini"}
-    model = await _scheduled_model("superchat-pi", "goal", "openai/gpt-5.6-luna", monkeypatch, env)
+    picks = {**_CLAUDE_PICKS, "pi": {"fast": "openai/gpt-5.6-mini"}}
+    model = await _scheduled_model(
+        "superchat-pi", "goal", "openai/gpt-5.6-luna", monkeypatch, picks
+    )
     assert model == "openai/gpt-5.6-mini"
 
 
-async def test_scheduled_helper_on_claude_bundle_keeps_the_global_fast_id(
+async def test_scheduled_helper_on_claude_bundle_runs_on_the_claude_fast_pick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = await _scheduled_model("superchat-claude", "worker", None, monkeypatch, _GLOBAL_CLAUDE_IDS)
+    model = await _scheduled_model("superchat-claude", "worker", None, monkeypatch, _CLAUDE_PICKS)
     assert model == "claude-haiku-4-5"
+
+
+async def test_scheduled_helper_with_nothing_picked_inherits_the_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = await _scheduled_model("superchat-claude", "worker", "team-model", monkeypatch, {})
+    assert model == "team-model"
 
 
 def _wake_deps(store: Any, conv_store: Any) -> Any:
@@ -549,3 +560,18 @@ async def test_dispatch_failure_marks_its_helper_failed() -> None:
     assert conv_store.live_status == {"conv_1": "failed"}
     assert store.runs[0]["conversation_id"] == "conv_1"
     assert "conv_parent" not in conv_store.appended  # a retry is pending
+
+
+def test_an_automation_run_says_it_is_one_by_name() -> None:
+    from omnigent.context.labels import SCHEDULED_HELPER_LABEL_KEY
+    from omnigent.server.scheduled.helper_fire import scheduled_brief
+
+    task = SimpleNamespace(name="Weekly files", prompt="Count my files.")
+    reporting = SimpleNamespace(labels={SCHEDULED_HELPER_LABEL_KEY: "task-1"})
+    silent = SimpleNamespace(labels={})
+
+    brief = scheduled_brief(task, reporting)  # type: ignore[arg-type]
+    assert 'automation "Weekly files"' in brief
+    assert 'Begin your final answer with: Automation "Weekly files":' in brief
+    assert brief.endswith("Count my files.")
+    assert scheduled_brief(task, silent) == "Count my files."  # type: ignore[arg-type]

@@ -14,8 +14,12 @@ const api = vi.hoisted(() => ({
   me: vi.fn(),
   models: { list: vi.fn(async () => [] as unknown[]), connect: vi.fn() },
   engineModels: {
-    status: vi.fn(async () => ({ enabled: false, harnesses: [], isAdmin: false, ready: false })),
+    status: vi.fn(async () => ({ enabled: false, harnesses: [], ready: false })),
     connect: vi.fn(),
+    providers: vi.fn(async () => [
+      { provider: "anthropic", label: "Anthropic", operatorKey: false },
+      { provider: "openrouter", label: "OpenRouter", operatorKey: false },
+    ]),
   },
   integrationSetup: { get: vi.fn(async () => null) },
   bots: {
@@ -264,7 +268,6 @@ it("on the engine, the model step saves the key there and never in Superchat", a
   api.engineModels.status.mockResolvedValueOnce({
     enabled: true,
     harnesses: [],
-    isAdmin: false,
     ready: false,
   });
   api.engineModels.connect.mockRejectedValueOnce(new Error("OpenRouter rejected this key"));

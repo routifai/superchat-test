@@ -43,7 +43,7 @@ from omnigent.superchat.models.upstreams import UPSTREAMS, Upstream
 
 _logger = logging.getLogger(__name__)
 
-KEY_REQUIRED_MESSAGE = "Add your Anthropic or OpenRouter API key in Settings to use Superchat."
+KEY_REQUIRED_MESSAGE = "Add a model API key in Settings to use Superchat."
 # connect/write/pool are short; a long read covers a model that thinks silently for minutes.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=10.0)
 # Request headers never forwarded: the caller's auth, hop-by-hop and transport framing.
@@ -78,16 +78,16 @@ def split_credential(request: Request) -> tuple[str, str] | None:
 
 
 def _checked_body(content: bytes, upstream_cfg: Upstream, path: str = "") -> tuple[bytes, str]:
-    """Enforce the upstream's vendor family on a request body's ``model`` and respell its id.
+    """Respell a request body's ``model`` the way the upstream expects it.
 
-    OpenRouter Chat Completions also get ``usage.include`` so the response reports the charge.
+    The model is not judged by its name: the upstream itself answers for a model it does not
+    serve. OpenRouter Chat Completions also get ``usage.include`` so the response reports the
+    charge.
 
     Only the (small) request body is parsed; a body that is not a JSON object with a string
     ``model`` is forwarded untouched, and so is one whose id the upstream already spells right.
 
     :returns: ``(body, requested_model)``; the model is ``""`` when the body names none.
-
-    :raises OmnigentError: ``MODEL_NOT_SUPPORTED`` when the upstream cannot serve the model.
     """
     try:
         payload = json.loads(content)
@@ -96,11 +96,6 @@ def _checked_body(content: bytes, upstream_cfg: Upstream, path: str = "") -> tup
     model = payload.get("model") if isinstance(payload, dict) else None
     if not isinstance(model, str):
         return content, ""
-    if not upstream_cfg.serves_model(model):
-        raise OmnigentError(
-            f"{upstream_cfg.label} only serves Claude models; {model!r} needs another connection.",
-            code=ErrorCode.MODEL_NOT_SUPPORTED,
-        )
     mapped = upstream_cfg.upstream_model(model)
     reports_cost = upstream_cfg.name == "openrouter" and path.endswith("chat/completions")
     if mapped == model and not reports_cost:
@@ -191,8 +186,10 @@ def create_model_proxy_router(
             return JSONResponse({"available": False, "reason": "no_connection"})
         from omnigent.superchat.models.rerank import RerankUnavailable
 
+        background = getattr(request.app.state, "model_background", None)
+        model = await background.light_model(managed.user_id) if background else None
         try:
-            plan = await asyncio.to_thread(rerank.plan, managed.user_id)
+            plan = await asyncio.to_thread(rerank.plan, managed.user_id, model)
         except RerankUnavailable as exc:
             return JSONResponse({"available": False, "reason": exc.reason})
         return JSONResponse(
@@ -214,7 +211,13 @@ def create_model_proxy_router(
             raise HTTPException(status_code=401, detail="unauthenticated")
         upstream_cfg = UPSTREAMS.get(provider)
         segments = path.split("/")
-        if upstream_cfg is None or segments[0] != "v1" or ".." in segments or "" in segments:
+        if (
+            upstream_cfg is None
+            or not upstream_cfg.configured
+            or segments[0] != "v1"
+            or ".." in segments
+            or "" in segments
+        ):
             raise HTTPException(status_code=404, detail="unknown model route")
         suspensions = get_suspensions()
         if suspensions is not None and await asyncio.to_thread(
@@ -227,12 +230,8 @@ def create_model_proxy_router(
             if breach is not None:
                 return _budget_refusal(breach.message)
         store = getattr(request.app.state, "model_connection_store", None)
-        connection = (
-            await asyncio.to_thread(
-                resolve_model_connection, store, owner_id=managed.user_id, preferred=(provider,)
-            )
-            if store is not None
-            else None
+        connection = await asyncio.to_thread(
+            resolve_model_connection, store, owner_id=managed.user_id, preferred=(provider,)
         )
         if connection is None:
             raise OmnigentError(KEY_REQUIRED_MESSAGE, code=ErrorCode.MODEL_KEY_REQUIRED)
@@ -249,7 +248,7 @@ def create_model_proxy_router(
         client = httpx.AsyncClient(transport=transport, timeout=_TIMEOUT, follow_redirects=False)
         upstream_request = client.build_request(
             request.method,
-            f"{upstream_cfg.base_url}/{path}",
+            f"{upstream_cfg.origin}/{path}",
             params=request.query_params,
             headers=headers,
             content=content,

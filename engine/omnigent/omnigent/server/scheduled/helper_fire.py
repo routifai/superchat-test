@@ -497,7 +497,8 @@ async def _launch_helper(
 
 
 async def _helper_harness(deps: FireDeps, parent: Conversation, sub_agent_name: str) -> str | None:
-    """The harness the bundle gives the Helper Type ``sub_agent_name`` (``None`` if unknown)."""
+    """The harness the bundle gives the Helper Type ``sub_agent_name`` (the bundle's own for a
+    Type it does not declare; ``None`` if unknown)."""
     if deps.agent_cache is None or parent.agent_id is None:
         return None
     from omnigent.models.model_catalog import spec_harness
@@ -509,7 +510,8 @@ async def _helper_harness(deps: FireDeps, parent: Conversation, sub_agent_name: 
             return None
         loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
         sub = _find_spec_by_name(loaded.spec, sub_agent_name)
-        return spec_harness(sub) if sub is not None else None
+        # A Type the bundle does not declare runs on the bundle's own harness.
+        return spec_harness(sub if sub is not None else loaded.spec)
     except Exception:
         _logger.exception("scheduled fire: could not resolve the Helper harness; using defaults")
         return None
@@ -543,13 +545,13 @@ async def _create_helper_session(
     # ``"<agent_type>:<task name>"``: Activity splits on the first colon, so it reads
     # "<Type>: <task name>" instead of an opaque id (format owned by superchat.activity.titles).
     run_type = scheduled_helper_type(task.agent_type)
-    _, run_model = resolve_scheduled_helper(
-        task.agent_type,
-        task.model_override,
-        harness=await _helper_harness(deps, parent, run_type),
-    )
-    # Nothing configured for this harness, or the owner's connection does not serve it: inherit
-    # the parent's model like a dispatch does.
+    from omnigent.superchat.models.tiers import tier_models
+
+    harness = await _helper_harness(deps, parent, run_type)
+    tiers = await tier_models(deps.app_state, task.user_id, harness)
+    _, run_model = resolve_scheduled_helper(task.agent_type, task.model_override, tiers)
+    # No usable catalog for this harness, or the parent's snapshot does not serve the model:
+    # inherit the parent's model like a dispatch does.
     from omnigent.server.routes.sandbox_inference import snapshot_serves_model
 
     if run_model is not None and not snapshot_serves_model(parent.inference_snapshot, run_model):
@@ -576,6 +578,26 @@ async def _create_helper_session(
     if conv is None:
         raise RuntimeError("helper title collision")
     return conv
+
+
+def scheduled_brief(task: ScheduledTask, conv: Conversation) -> str:
+    """
+    The prompt a run starts with; an automation run says it is one, by name.
+
+    The Result goes back to the person's chat unprompted, so it has to say where it comes from:
+    otherwise the chat reads it as work nobody asked for.
+
+    :param task: The scheduled task being fired.
+    :param conv: The Helper session the run executes in.
+    :returns: The task prompt, prefixed for a run that reports back to its parent.
+    """
+    if SCHEDULED_HELPER_LABEL_KEY not in (getattr(conv, "labels", None) or {}):
+        return task.prompt
+    return (
+        f'This is the person\'s automation "{task.name}", running on its schedule (not a '
+        f'message in chat). Begin your final answer with: Automation "{task.name}": '
+        f"\n\n{task.prompt}"
+    )
 
 
 def _make_parent_runner_dispatch(
@@ -618,7 +640,7 @@ def _make_parent_runner_dispatch(
         await _dispatch_session_event_to_runner(
             conv.id,
             conv_for_dispatch,
-            event or fire._prompt_event(task.prompt),
+            event or fire._prompt_event(scheduled_brief(task, conv)),
             deps.conversation_store,
             runner_client,
             agent_name=None,
