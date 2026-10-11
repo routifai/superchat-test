@@ -9,11 +9,9 @@ import { rpc } from "../../../lib/rpc";
 import type { DockKey } from "../chrome/Dock";
 import { DockSheet, DockSheetHeader } from "../chrome/DockSheet";
 import { readFileAsBase64 } from "../conversation/shared";
-import { PRIMARY_BUTTON, QUIET_BUTTON, SegmentedControl } from "../ui";
+import { QUIET_BUTTON } from "../ui";
 
-type FilesView = "workspace" | "made";
-
-function MiniAppsSheet({
+function LibrarySheet({
   botId,
   botName,
   open,
@@ -30,23 +28,16 @@ function MiniAppsSheet({
 }) {
   const { t } = useLingui();
   return (
-    <DockSheet open={open} title={t`Mini Apps`} onClose={onClose}>
-      <DockSheetHeader title={t`Mini Apps`} subtitle={t`Small apps I built for you.`} />
+    <DockSheet open={open} title={t`Library`} onClose={onClose}>
+      <DockSheetHeader title={t`Library`} subtitle={t`Apps, decks and documents I made for you.`}>
+        <button type="button" className={QUIET_BUTTON} onClick={onNewApp}>
+          <Plus size={15} strokeWidth={2} aria-hidden="true" className="me-1 -ms-0.5" />
+          <Trans>New app</Trans>
+        </button>
+      </DockSheetHeader>
       {open ? (
-        <div className="rk-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
-          <LibraryScreen
-            embedded
-            mode="apps"
-            botId={botId}
-            botName={botName}
-            onSendIdea={onSendIdea}
-            toolbarAction={
-              <button type="button" className={PRIMARY_BUTTON} onClick={onNewApp}>
-                <Plus size={16} aria-hidden="true" className="me-1.5" />
-                <Trans>New app</Trans>
-              </button>
-            }
-          />
+        <div className="rk-scroll -mx-1 flex min-h-0 flex-1 flex-col overflow-y-auto px-1">
+          <LibraryScreen embedded botId={botId} botName={botName} onSendIdea={onSendIdea} />
         </div>
       ) : null}
     </DockSheet>
@@ -55,26 +46,21 @@ function MiniAppsSheet({
 
 function FilesSheet({
   botId,
-  botName,
   open,
   onClose,
   refreshKey,
   reveal,
   onChatWithFolder,
-  onSendIdea,
 }: {
   botId: string;
-  botName: string;
   open: boolean;
   onClose: () => void;
   refreshKey: number;
   reveal: { path: string; nonce: number } | null;
   /** Opens a side chat working in `folder` (workspace-relative; `""` is the whole workspace). */
   onChatWithFolder: (folder: string) => void;
-  onSendIdea: (text: string) => void;
 }) {
   const { t } = useLingui();
-  const [view, setView] = useState<FilesView>("workspace");
   // The folder "Chat with" uses; none picked is the whole workspace.
   const [folder, setFolder] = useState<string | null>(null);
   const [uploads, setUploads] = useState(0);
@@ -106,19 +92,8 @@ function FilesSheet({
 
   return (
     <DockSheet open={open} title={t`Files`} onClose={onClose}>
-      <DockSheetHeader title={t`Files`} subtitle={t`Your workspace, and what I made for you.`}>
-        <SegmentedControl
-          label={t`Files view`}
-          className="shrink-0 [&>button]:flex-none"
-          value={view}
-          onChange={setView}
-          options={[
-            { value: "workspace", label: t`Workspace` },
-            { value: "made", label: t`Made for you` },
-          ]}
-        />
-      </DockSheetHeader>
-      {open && view === "workspace" ? (
+      <DockSheetHeader title={t`Files`} subtitle={t`Your workspace.`} />
+      {open ? (
         <div className="flex min-h-0 flex-1 flex-col gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <input
@@ -165,11 +140,6 @@ function FilesSheet({
           </div>
         </div>
       ) : null}
-      {open && view === "made" ? (
-        <div className="rk-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
-          <LibraryScreen embedded botId={botId} botName={botName} onSendIdea={onSendIdea} />
-        </div>
-      ) : null}
     </DockSheet>
   );
 }
@@ -210,7 +180,7 @@ export function DockSheets({
         open={sheet === "inbox"}
         onOpenChange={(open) => !open && onClose()}
       />
-      <MiniAppsSheet
+      <LibrarySheet
         botId={botId}
         botName={botName}
         open={sheet === "apps"}
@@ -224,7 +194,6 @@ export function DockSheets({
       <AutomationsSheet botId={botId} open={sheet === "automations"} onClose={onClose} />
       <FilesSheet
         botId={botId}
-        botName={botName}
         open={sheet === "files"}
         onClose={onClose}
         refreshKey={filesRefreshKey}
@@ -233,7 +202,6 @@ export function DockSheets({
           onClose();
           onOpenFolderChat(folder);
         }}
-        onSendIdea={sendAndClose}
       />
     </>
   );

@@ -17,13 +17,21 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@superchat/ui-web";
-import { ChevronRight, Folder, X } from "lucide-react";
+import { ChevronRight, GitFork, X } from "lucide-react";
 import type { ComponentType, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LoadingState } from "../../components/ai/primitives";
 import { ReplyCardSendProvider } from "../../components/cards/context";
-import { type ChatProject, ProjectChip, useChatProject } from "../../pages/muse/chrome/ProjectChip";
+import { type ChatProject, ProjectChip } from "../../pages/muse/chrome/ProjectChip";
 import { RestoreButton } from "../../pages/muse/chrome/RestoreButton";
+import { optimisticMessage, userCount } from "../../pages/muse/conversation/museTranscript";
+import {
+  type FolderEntry,
+  type ListFolder,
+  useChatPlace,
+  WorkInChip,
+  WorkInPill,
+} from "../projects/WorkIn";
 
 /** The Side Chat session's wire: what it needs from `chats.*`, kept as an explicit shape
  * (not the `rpc` client) so the dev fixture page can supply fakes instead. */
@@ -42,11 +50,28 @@ export type SideChatWire = {
   send: (input: { chatId: string; text: string }) => Promise<{ ok: true }>;
   /** The person has the chat open: clears its unread flag. Fixtures may leave it out. */
   markRead?: (input: { botId: string; chatId: string }) => Promise<unknown>;
-  /** The Project the chat has open; fixtures may leave it out. */
-  project?: (input: { botId: string; chatId: string }) => Promise<{ project: ChatProject | null }>;
+  /** Where the chat works (its Project and folder); fixtures may leave it out. */
+  project?: (input: { botId: string; chatId: string }) => Promise<{
+    project: ChatProject | null;
+    folder?: string | null;
+    chosen?: boolean;
+  }>;
+  /** Lists one workspace folder for the "Work in" menu; without it a chat cannot be moved. */
+  listFolder?: (input: { botId: string; path: string }) => Promise<{ entries: FolderEntry[] }>;
+  /** The person moves the chat to a folder (`null`: the whole workspace). */
+  setFolder?: (input: { botId: string; chatId: string; folder: string | null }) => Promise<unknown>;
   /** Restores an archived chat; without it an archived chat shows no Restore. */
   unarchive?: (input: { botId: string; chatId: string }) => Promise<unknown>;
 };
+
+/** The wire's folder listing as the "Work in" menu reads it, stable across renders. */
+function useFolderLister(wire: SideChatWire, botId: string): ListFolder | null {
+  return useMemo(() => {
+    const list = wire.listFolder;
+    if (!list) return null;
+    return (path: string) => list({ botId, path }).then(({ entries }) => entries);
+  }, [wire, botId]);
+}
 
 /** The context summary a person can read: markdown, capped in height, scrolls past it. */
 function SummaryBody({ text }: { text: string }) {
@@ -96,7 +121,8 @@ export function SideChatSession({
   onCreated,
   onReplied,
   onClose,
-  onOpenProject,
+  onShowFolder,
+  onShowAsFork,
   onRestored,
   focusMessageId,
   folder,
@@ -113,8 +139,10 @@ export function SideChatSession({
   /** A reply finished: the chat is no longer live, so the Chat List should refresh. */
   onReplied?: () => void;
   onClose: () => void;
-  /** Show a Project's folder (the "Working in" chip). */
-  onOpenProject?: (project: ChatProject) => void;
+  /** Show a workspace folder in Files (the "Working in" chip). */
+  onShowFolder?: (folder: string) => void;
+  /** A chat that started as a fork goes back to its fork view, over its message. */
+  onShowAsFork?: (chat: ChatSummary) => void;
   /** The archived chat was restored: the caller shows it as an open chat (not archived). */
   onRestored?: () => void;
   /** A search hit: scroll to this message once the chat has loaded. */
@@ -152,22 +180,11 @@ export function SideChatSession({
       focusMessageId={focusMessageId}
       onReplied={onReplied}
       onClose={onClose}
-      onOpenProject={onOpenProject}
+      onShowFolder={onShowFolder}
+      onShowAsFork={onShowAsFork}
       onRestored={onRestored}
     />
   );
-}
-
-/** What the person just sent, shown before the engine has recorded it. */
-function optimisticMessage(chatId: string, text: string): ThreadMessage {
-  return {
-    id: "optimistic",
-    threadId: chatId,
-    seq: Number.MAX_SAFE_INTEGER,
-    role: "user",
-    blocks: [{ kind: "text", text }],
-    createdAt: new Date().toISOString(),
-  };
 }
 
 /** A calm inline note under the message that did not go through. */
@@ -206,10 +223,13 @@ export function SendFailureNote({
 function SessionHeader({
   title,
   meta,
+  actions,
   onClose,
 }: {
   title: string;
   meta?: ReactNode;
+  /** Quiet actions before the close button. */
+  actions?: ReactNode;
   onClose: () => void;
 }) {
   const { t } = useLingui();
@@ -221,6 +241,7 @@ function SessionHeader({
         </div>
         {meta}
       </div>
+      {actions}
       <button
         type="button"
         onClick={onClose}
@@ -251,6 +272,9 @@ function DraftSideChat({
   const { t } = useLingui();
   const [sent, setSent] = useState<string | null>(null);
   const [knows, setKnows] = useState(true);
+  // Where it will work: the folder it was opened with (from Files), until the person picks.
+  const [workIn, setWorkIn] = useState<string | null>(folder || null);
+  const listFolder = useFolderLister(wire, bot.id);
   const [preview, setPreview] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [failure, setFailure] = useState<SendFailure | null>(null);
@@ -277,7 +301,7 @@ function DraftSideChat({
         botId: bot.id,
         start: knows ? "withContext" : "blank",
         text,
-        ...(folder !== null ? { folder } : {}),
+        ...(workIn !== null ? { folder: workIn } : {}),
       })
       .then((created) => onCreated(created, text))
       .catch(() => {
@@ -294,26 +318,6 @@ function DraftSideChat({
           <h2 className="text-[19px] font-semibold tracking-[-0.01em] text-foreground">
             <Trans>What do you want to look at?</Trans>
           </h2>
-          {folder !== null ? (
-            <span
-              data-testid="side-chat-folder"
-              className="mt-3 inline-flex max-w-full items-center gap-2 rounded-full border border-glass-line bg-black/20 px-3 py-1.5 text-[13.5px] text-foreground"
-            >
-              <Folder
-                size={15}
-                strokeWidth={1.7}
-                aria-hidden="true"
-                className="shrink-0 text-tint-ink"
-              />
-              <span className="truncate" dir="auto">
-                {folder ? (
-                  <Trans>Working in {folder}</Trans>
-                ) : (
-                  <Trans>Working in the whole workspace</Trans>
-                )}
-              </span>
-            </span>
-          ) : null}
         </div>
       ) : (
         <view.Transcript
@@ -329,7 +333,7 @@ function DraftSideChat({
         />
       )}
       <div
-        className={`mx-auto mb-1 w-full max-w-[748px] justify-center px-4 ${sent === null ? "flex" : "hidden"}`}
+        className={`mx-auto mb-1 w-full max-w-[748px] flex-wrap justify-center gap-2 px-4 ${sent === null ? "flex" : "hidden"}`}
       >
         <Tooltip>
           <TooltipTrigger
@@ -361,7 +365,7 @@ function DraftSideChat({
           <Popover>
             <PopoverTrigger
               type="button"
-              className="ms-2 inline-flex h-8 items-center rounded-full px-3 text-[13px] text-muted-foreground hover:text-foreground"
+              className="inline-flex h-8 items-center rounded-full px-3 text-[13px] text-muted-foreground hover:text-foreground"
             >
               <Trans>See summary</Trans>
             </PopoverTrigger>
@@ -370,6 +374,7 @@ function DraftSideChat({
             </PopoverContent>
           </Popover>
         ) : null}
+        {listFolder ? <WorkInPill list={listFolder} folder={workIn} onPick={setWorkIn} /> : null}
       </div>
       <view.Composer placeholder={t`Message this side chat`} sending={sending} onSend={send} />
     </div>
@@ -380,9 +385,6 @@ function DraftSideChat({
 const REPLY_WAIT_MAX_MS = 3 * 60 * 1000;
 /** A reply's message can land just before the chat stops being live: look once more. */
 const SETTLE_RECHECK_MS = 1500;
-
-const userCount = (messages: ThreadMessage[] | null) =>
-  messages?.filter((message) => message.role === "user").length ?? 0;
 
 /** The chat a session reads: enough of a `ChatSummary` (a fork's stub carries no more). */
 export type SideChatRef = Pick<ChatSummary, "id" | "live" | "unread" | "archived">;
@@ -601,7 +603,8 @@ function ExistingSideChat({
   focusMessageId,
   onReplied,
   onClose,
-  onOpenProject,
+  onShowFolder,
+  onShowAsFork,
   onRestored,
 }: {
   bot: SideChatBot;
@@ -614,7 +617,8 @@ function ExistingSideChat({
   focusMessageId?: string;
   onReplied?: () => void;
   onClose: () => void;
-  onOpenProject?: (project: ChatProject) => void;
+  onShowFolder?: (folder: string) => void;
+  onShowAsFork?: (chat: ChatSummary) => void;
   onRestored?: () => void;
 }) {
   const { t } = useLingui();
@@ -631,11 +635,19 @@ function ExistingSideChat({
   } = useSideChatThread({ bot, chat, wire, firstText, firstFailed, onReplied });
   const loadProject = wire.project;
   const unarchive = wire.unarchive;
-  const project = useChatProject(
+  const { place, reload: reloadPlace } = useChatPlace(
     loadProject ? () => loadProject({ botId: bot.id, chatId: chat.id }) : undefined,
     chat.id,
     `${messages?.length ?? 0}:${awaitingReply}`,
   );
+  const project = place?.project ?? null;
+  const listFolder = useFolderLister(wire, bot.id);
+  const setFolder = wire.setFolder;
+  // The person may move a chat they can write in; an archived or read-only one only says where.
+  const mover =
+    !chat.archived && !readOnly && loadProject && listFolder && setFolder
+      ? { list: listFolder, set: setFolder }
+      : null;
 
   const scrollRequest = useMemo(
     () => (focusMessageId ? { messageId: focusMessageId, nonce: 1 } : null),
@@ -659,8 +671,21 @@ function ExistingSideChat({
     <div className="relative flex h-full min-h-0 w-full flex-col">
       <SessionHeader
         title={chat.title}
+        actions={
+          chat.anchorItemId && onShowAsFork ? (
+            <button
+              type="button"
+              data-testid="show-as-fork"
+              onClick={() => onShowAsFork(chat)}
+              className="app-no-drag pointer-events-auto inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-[13px] text-ink-2 transition-colors hover:bg-selection hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
+            >
+              <GitFork size={15} strokeWidth={1.75} aria-hidden />
+              <Trans>Show as fork</Trans>
+            </button>
+          ) : undefined
+        }
         meta={
-          chat.archived || (project && onOpenProject) ? (
+          chat.archived || mover || (project && onShowFolder) ? (
             <div className="mt-1 flex items-center gap-2">
               {chat.archived ? (
                 <span className="text-[12px] text-muted-foreground">
@@ -674,8 +699,20 @@ function ExistingSideChat({
                   }
                 />
               ) : null}
-              {project && onOpenProject ? (
-                <ProjectChip project={project} onOpen={onOpenProject} />
+              {mover ? (
+                <WorkInChip
+                  place={place}
+                  list={mover.list}
+                  onShow={onShowFolder}
+                  onPick={(folder) =>
+                    mover.set({ botId: bot.id, chatId: chat.id, folder }).then(reloadPlace)
+                  }
+                />
+              ) : project && onShowFolder ? (
+                <ProjectChip
+                  project={project}
+                  onOpen={(open) => onShowFolder(`projects/${open.slug}`)}
+                />
               ) : null}
             </div>
           ) : undefined

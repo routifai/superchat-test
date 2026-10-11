@@ -1,96 +1,16 @@
-import type { Bot, Group, ThreadSnapshot } from "@superchat/contracts";
-import type { Dispatch, ReactNode, SetStateAction } from "react";
-import { useNavigate } from "react-router-dom";
-import { rpc } from "../../../lib/rpc";
-import { GroupSettings } from "../../GroupPanel";
-import { BotSettings } from "../../shell/bot-panel";
-import { firstThreadRoute } from "../conversation/threadEvents";
-import type { Panel } from "./panel";
+import { Trans } from "@lingui/react/macro";
+import { Button } from "@superchat/ui-web";
 
-/** Group settings: save and remove. */
-export function GroupSettingsPanel({
-  activeGroup,
-  bots,
-  groups,
-  setGroups,
-  setPanel,
-  refreshBots,
-  refreshGroupThread,
-}: {
-  activeGroup: Group;
-  bots: Bot[];
-  groups: Group[];
-  setGroups: Dispatch<SetStateAction<Group[]>>;
-  setPanel: Dispatch<SetStateAction<Panel>>;
-  refreshBots: () => Promise<void>;
-  refreshGroupThread: (id: string) => Promise<ThreadSnapshot>;
-}) {
-  const navigate = useNavigate();
+/** The Muse's settings panel: clearing the Conversation. */
+export function BotSettingsPanel({ onClear }: { onClear: () => void }) {
   return (
-    <GroupSettings
-      key={activeGroup.id}
-      group={activeGroup}
-      bots={bots}
-      onSave={async (input) => {
-        const updated = await rpc.groups.update({ groupId: activeGroup.id, ...input });
-        setGroups((current) => current.map((group) => (group.id === updated.id ? updated : group)));
-        setPanel(null);
-        await Promise.all([refreshBots(), refreshGroupThread(activeGroup.id)]).catch(
-          () => undefined,
-        );
-      }}
-      onRemove={async () => {
-        await rpc.groups.remove({ groupId: activeGroup.id });
-        const remainingGroups = groups.filter((group) => group.id !== activeGroup.id);
-        setGroups(remainingGroups);
-        setPanel(null);
-        navigate(firstThreadRoute(bots, remainingGroups), { replace: true });
-        await refreshBots().catch(() => undefined);
-      }}
-    />
-  );
-}
-
-/** The Muse's settings panel: save, export and clear. */
-export function BotSettingsPanel({
-  active,
-  skillsSection,
-  refreshBots,
-  onClear,
-}: {
-  active: Bot;
-  skillsSection?: ReactNode;
-  refreshBots: () => Promise<void>;
-  onClear?: () => void;
-}) {
-  return (
-    <BotSettings
-      key={active.id}
-      bot={active}
-      skillsSection={skillsSection}
-      onSave={async ({ computerMode, ...patch }) => {
-        if (computerMode !== active.computerMode) {
-          await rpc.bots.setComputer({
-            botId: active.id,
-            mode: computerMode,
-          });
-        }
-        await rpc.bots.update({ botId: active.id, ...patch });
-        await refreshBots();
-      }}
-      onExport={async () => {
-        const manifest = await rpc.export.bot({ botId: active.id });
-        const blob = new Blob([JSON.stringify(manifest, null, 2)], {
-          type: "application/json",
-        });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `${active.name.toLowerCase().replace(/\s+/g, "-")}-export.json`;
-        a.click();
-        URL.revokeObjectURL(url);
-      }}
-      onClear={onClear}
-    />
+    <Button
+      variant="ghost"
+      size="sm"
+      className="-ms-2.5 text-destructive hover:text-destructive"
+      onClick={onClear}
+    >
+      <Trans>Clear conversation</Trans>
+    </Button>
   );
 }

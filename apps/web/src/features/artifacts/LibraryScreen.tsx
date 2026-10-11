@@ -9,8 +9,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@superchat/ui-web";
-import { Search } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ArtifactKind } from "../../lib/artifact-kind";
 import { artifactKind, KIND_ORDER, kindFacetLabel } from "../../lib/artifact-kind";
 import { decodeArtifactBase64, downloadArtifactBytes } from "../../lib/artifact-open";
@@ -23,33 +22,25 @@ import {
   MuseWideCenter,
   ScreenHeader,
   ScreenHero,
-  SegmentedControl,
 } from "../../pages/muse/ui";
 import { ArtifactPreviewDialog } from "./library/ArtifactPreviewDialog";
 import { LibraryGrid, LibrarySkeletonGrid } from "./library/LibraryGrid";
+import { type FilterChip, FilterChips, LibrarySearchField } from "./library/LibraryToolbar";
 import type { ArtifactSummary } from "./library/types";
 
-/** A facet's count, quiet beside its label. */
-function Count({ n }: { n: number }) {
-  return <span className="text-ink-3 tabular-nums">{n}</span>;
-}
+type Facet = ArtifactKind | "published" | "private" | "all";
 
 const LIST_PAGE_SIZE = 60;
 // Safety net against an unbounded fetch loop; a Library this size is not realistic.
 const MAX_PAGES = 12;
 
 const LIBRARY_SUGGESTIONS = [
-  "Draft a one-pager on our new product",
-  "Build a meeting brief template",
-];
-
-const APP_SUGGESTIONS = [
   "Build me a simple expense tracker app",
-  "Make a habit tracker I can use every day",
+  "Make a short deck about our new product",
 ];
 
 /**
- * F7 · Library. Everything the Muse has made — pages, documents, files — from the
+ * F7 · Library. Everything the Muse has made — apps, decks, documents, files — from the
  * Conversation and every Goal log, searchable in one grid. `artifacts.listSpace` is
  * space-scoped with an optional bot filter, not thread-scoped, and Goal-log turns
  * create artifacts under the same bot id as the Conversation, so they all show up
@@ -58,32 +49,20 @@ const APP_SUGGESTIONS = [
 export function LibraryScreen({
   botId,
   onSendIdea,
-  skills,
   embedded = false,
-  mode = "all",
-  toolbarAction,
 }: {
   botId: string;
   botName?: string;
-  /** The Skills tab's content, filled by the shell (skills is its own capability); no tab without it. */
-  skills?: ReactNode;
   /** Starts a Conversation with a suggestion from the empty state. */
   onSendIdea?: (text: string) => void;
   /** Inside a dock sheet: no screen chrome or hero, just the toolbar and the grid. */
   embedded?: boolean;
-  /** "apps" lists only the HTML apps (pages, not decks), each marked Published or Private. */
-  mode?: "all" | "apps";
-  /** A button beside the search, e.g. "New app". */
-  toolbarAction?: ReactNode;
 }) {
   const { t } = useLingui();
   const [items, setItems] = useState<ArtifactSummary[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [view, setView] = useState<"made" | "skills">("made");
   const [query, setQuery] = useState("");
-  const [selectedKind, setSelectedKind] = useState<ArtifactKind | "published" | "private" | "all">(
-    "all",
-  );
+  const [selectedKind, setSelectedKind] = useState<Facet>("all");
   const [openArtifactId, setOpenArtifactId] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ArtifactSummary | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
@@ -101,11 +80,7 @@ export function LibraryScreen({
       for (let page = 0; page < MAX_PAGES; page += 1) {
         const result = await rpc.artifacts.listSpace({ botId, cursor, limit: LIST_PAGE_SIZE });
         if (cancelled) return;
-        all = all.concat(
-          mode === "apps"
-            ? result.items.filter((item) => artifactKind(item.mimeType, item.name) === "page")
-            : result.items,
-        );
+        all = all.concat(result.items);
         setItems(all);
         if (!result.nextCursor) return;
         cursor = result.nextCursor;
@@ -121,7 +96,7 @@ export function LibraryScreen({
     return () => {
       cancelled = true;
     };
-  }, [botId, mode, t]);
+  }, [botId, t]);
 
   const facetCounts = useMemo(() => {
     const counts = new Map<ArtifactKind, number>();
@@ -188,61 +163,50 @@ export function LibraryScreen({
   const total = items?.length ?? 0;
   const visibleKinds = KIND_ORDER.filter((kind) => (facetCounts.get(kind) ?? 0) > 0);
 
-  const apps = mode === "apps";
-  const content =
-    view === "skills" && skills ? (
-      skills
-    ) : (
-      <>
-        {total > 0 ? (
-          <label className="relative block sm:hidden">
-            <Search
-              size={14}
-              strokeWidth={1.9}
-              aria-hidden="true"
-              className="pointer-events-none absolute start-3 top-1/2 -translate-y-1/2 text-ink-3"
-            />
-            <input
-              type="search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={t`Search your Library…`}
-              aria-label={t`Search your Library`}
-              className="h-9 w-full rounded-full bg-selection ps-8 pe-3 text-[13px] text-foreground outline-none placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-ring"
-            />
-          </label>
-        ) : null}
-
-        {items === null ? (
-          <LibrarySkeletonGrid />
-        ) : items.length === 0 ? (
-          loadError ? (
-            <p className="py-10 text-[14px] text-destructive">{loadError}</p>
-          ) : (
-            <EmptyState
-              illustration="books"
-              headline={apps ? t`No apps yet.` : t`Nothing here yet.`}
-              suggestions={apps ? APP_SUGGESTIONS : LIBRARY_SUGGESTIONS}
-              onSuggestion={onSendIdea}
-            >
-              {apps
-                ? t`Apps superchat builds for you will appear here.`
-                : t`Pages, documents and files your Muse makes will appear here.`}
-            </EmptyState>
-          )
-        ) : filtered && filtered.length === 0 ? (
-          <EmptyState headline={t`Nothing matches your search.`} />
+  const facets: FilterChip<Facet>[] = [
+    { value: "all", label: t`All`, count: total },
+    ...visibleKinds.map((kind) => ({
+      value: kind,
+      label: kindFacetLabel(kind),
+      count: facetCounts.get(kind) ?? 0,
+    })),
+    ...(publishedCount > 0
+      ? [{ value: "published" as const, label: t`Published`, count: publishedCount }]
+      : []),
+  ];
+  // A filter earns its place only when one of its choices shows less than "All" does.
+  const kindControl = facets.some((facet) => facet.value !== "all" && facet.count < total) ? (
+    <FilterChips label={t`Kind`} value={selectedKind} onChange={setSelectedKind} options={facets} />
+  ) : null;
+  const content = (
+    <>
+      {items === null ? (
+        <LibrarySkeletonGrid />
+      ) : items.length === 0 ? (
+        loadError ? (
+          <p className="py-10 text-[14px] text-destructive">{loadError}</p>
         ) : (
-          <LibraryGrid
-            items={filtered ?? []}
-            showVisibility={apps}
-            onOpen={(item) => setOpenArtifactId(item.id)}
-            onDownload={(item) => void handleDownload(item)}
-            onDelete={setPendingDelete}
-          />
-        )}
-      </>
-    );
+          <EmptyState
+            illustration="books"
+            headline={t`Nothing here yet.`}
+            suggestions={LIBRARY_SUGGESTIONS}
+            onSuggestion={onSendIdea}
+          >
+            {t`Apps, decks, documents and files your Muse makes will appear here.`}
+          </EmptyState>
+        )
+      ) : filtered && filtered.length === 0 ? (
+        <EmptyState headline={t`Nothing matches your search.`} />
+      ) : (
+        <LibraryGrid
+          items={filtered ?? []}
+          onOpen={(item) => setOpenArtifactId(item.id)}
+          onDownload={(item) => void handleDownload(item)}
+          onDelete={setPendingDelete}
+        />
+      )}
+    </>
+  );
   const dialogs = (
     <>
       {openArtifactId ? (
@@ -298,39 +262,13 @@ export function LibraryScreen({
 
   if (embedded) {
     return (
-      <div className="flex min-h-0 flex-1 flex-col gap-4" data-testid="library-embedded">
-        <div className="flex flex-wrap items-center gap-3">
-          <label className="relative block min-w-[220px] flex-1">
-            <Search
-              size={16}
-              strokeWidth={1.9}
-              aria-hidden="true"
-              className="pointer-events-none absolute start-3.5 top-1/2 -translate-y-1/2 text-ink-2"
-            />
-            <input
-              type="search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={apps ? t`Search your apps…` : t`Search your Library…`}
-              aria-label={apps ? t`Search your apps` : t`Search your Library`}
-              className="min-h-11 w-full rounded-xl border border-glass-line bg-black/20 ps-10 pe-3.5 text-[14px] text-foreground outline-none placeholder:text-ink-2 focus-visible:outline-2 focus-visible:outline-ring"
-            />
-          </label>
-          {apps && total > 0 ? (
-            <SegmentedControl
-              label={t`Visibility`}
-              className="shrink-0 [&>button]:flex-none"
-              value={selectedKind}
-              onChange={setSelectedKind}
-              options={[
-                { value: "all" as const, label: t`All` },
-                { value: "published" as const, label: t`Published` },
-                { value: "private" as const, label: t`Private` },
-              ]}
-            />
-          ) : null}
-          {toolbarAction}
-        </div>
+      <div className="flex min-h-0 flex-1 flex-col gap-5" data-testid="library-embedded">
+        {total > 0 ? (
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5">
+            <LibrarySearchField value={query} onChange={setQuery} className="flex-1" />
+            {kindControl}
+          </div>
+        ) : null}
         {content}
         {dialogs}
       </div>
@@ -345,34 +283,11 @@ export function LibraryScreen({
           dragRegion
           actions={
             <>
-              {view === "made" && total > 0 ? (
-                <label className="relative hidden sm:block">
-                  <Search
-                    size={14}
-                    strokeWidth={1.9}
-                    aria-hidden="true"
-                    className="pointer-events-none absolute start-3 top-1/2 -translate-y-1/2 text-ink-3"
-                  />
-                  <input
-                    type="search"
-                    value={query}
-                    onChange={(event) => setQuery(event.target.value)}
-                    placeholder={t`Search your Library…`}
-                    aria-label={t`Search your Library`}
-                    className="superchat-glass-pill h-8 w-[200px] rounded-full ps-8 pe-3 text-[13px] text-foreground outline-none placeholder:text-ink-3 focus-visible:outline-2 focus-visible:outline-ring"
-                  />
-                </label>
-              ) : null}
-              {skills ? (
-                <SegmentedControl
-                  label={t`Library view`}
-                  value={view}
-                  onChange={setView}
-                  className="w-[200px]"
-                  options={[
-                    { value: "made", label: t`Made for you` },
-                    { value: "skills", label: t`Skills` },
-                  ]}
+              {total > 0 ? (
+                <LibrarySearchField
+                  value={query}
+                  onChange={setQuery}
+                  className="hidden w-[240px] sm:block"
                 />
               ) : null}
             </>
@@ -388,48 +303,12 @@ export function LibraryScreen({
             </SuperchatTile>
           }
           title={<Trans>Library</Trans>}
-          subtitle={view === "made" ? <Trans>Everything I made for you.</Trans> : undefined}
-          action={
-            view === "made" && total > 0 ? (
-              <SegmentedControl
-                label={t`Kind`}
-                value={selectedKind}
-                onChange={setSelectedKind}
-                className="max-w-full"
-                options={[
-                  {
-                    value: "all" as const,
-                    label: (
-                      <>
-                        {t`All`} <Count n={total} />
-                      </>
-                    ),
-                  },
-                  ...visibleKinds.map((kind) => ({
-                    value: kind,
-                    label: (
-                      <>
-                        {kindFacetLabel(kind)} <Count n={facetCounts.get(kind) ?? 0} />
-                      </>
-                    ),
-                  })),
-                  ...(publishedCount > 0
-                    ? [
-                        {
-                          value: "published" as const,
-                          label: (
-                            <>
-                              {t`Published`} <Count n={publishedCount} />
-                            </>
-                          ),
-                        },
-                      ]
-                    : []),
-                ]}
-              />
-            ) : undefined
-          }
+          subtitle={<Trans>Everything I made for you.</Trans>}
+          action={total > 0 ? (kindControl ?? undefined) : undefined}
         />
+        {total > 0 ? (
+          <LibrarySearchField value={query} onChange={setQuery} className="mb-4 sm:hidden" />
+        ) : null}
         {content}
       </MuseWideCenter>
 

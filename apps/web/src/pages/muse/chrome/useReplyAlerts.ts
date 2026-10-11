@@ -11,35 +11,30 @@ type Notify = (
   streamReady: boolean,
   botName: string,
   enabled: boolean,
-  groupNotification: boolean,
 ) => void;
 
-/** Unread dot and browser notification for the Muse's replies, driven by the family stream
- * because the reply is no longer a Superchat thread row that raises them itself. */
+/** Browser notification for the Muse's replies, driven by the family stream. */
 export function useReplyAlerts({
   bot,
   conversationId,
   notifyBrowserForEvent,
-  refreshBots,
 }: {
   bot: Bot | undefined;
   conversationId: string | null;
   notifyBrowserForEvent: Notify;
-  refreshBots: () => Promise<void>;
 }) {
-  const latest = useRef({ bot, conversationId, notifyBrowserForEvent, refreshBots });
-  latest.current = { bot, conversationId, notifyBrowserForEvent, refreshBots };
+  const latest = useRef({ bot, conversationId, notifyBrowserForEvent });
+  latest.current = { bot, conversationId, notifyBrowserForEvent };
   const botId = bot?.id;
   useEffect(() => {
     if (!botId) return;
     return watchFamily(botId, (event) => {
-      const { bot, conversationId, notifyBrowserForEvent, refreshBots } = latest.current;
+      const { bot, conversationId, notifyBrowserForEvent } = latest.current;
       if (!bot) return;
       void alertForReply(event, {
         botId: bot.id,
         botName: bot.name,
-        enabled: bot.notifyOnFinish,
-        conversationId,
+        enabled: true,
         focused: () => document.visibilityState === "visible" && document.hasFocus(),
         readText: async (chatId, itemId) => {
           const page = await rpc.chats.transcript({
@@ -52,12 +47,8 @@ export function useReplyAlerts({
             .filter(Boolean)
             .join("\n");
         },
-        markUnread: async () => {
-          await rpc.threads.markUnread({ botId: bot.id });
-          await refreshBots();
-        },
         notify: (notification, name, enabled) =>
-          notifyBrowserForEvent(notification, notification.threadId, 0, true, name, enabled, false),
+          notifyBrowserForEvent(notification, notification.threadId, 0, true, name, enabled),
       });
     });
   }, [botId]);

@@ -11,6 +11,10 @@ export interface OmnigentSessionSuperchat {
   seed_item_id: string | null;
   /** The Project the session has open (ADR 0008). */
   project: { slug: string; name: string } | null;
+  /** The working directory relative to the workspace (`null` at its root). */
+  folder?: string | null;
+  /** The person chose that folder themselves; the Muse keeps it. */
+  workspace_chosen?: boolean;
 }
 
 /** `GET /v1/sessions/{id}` — a cheap session snapshot (no items, liveness or usage). */
@@ -164,7 +168,7 @@ export interface OmnigentPaginatedList<T> {
 /**
  * `GET /v1/sessions/{id}/stream` — live SSE tail. Yields each parsed `data:` frame (skipping
  * the `[DONE]` sentinel and unparsable keepalive lines) until the response body ends or
- * `signal` aborts. Buffering/parsing mirrors apps/mobile/lib/api.ts's `subscribeThread`.
+ * `signal` aborts.
  */
 export function streamOmnigentSession(
   config: OmnigentClientConfig,

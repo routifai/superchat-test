@@ -1,8 +1,8 @@
 import { i18n } from "@lingui/core";
 import { useLingui } from "@lingui/react/macro";
-import type { MessageReaction, ThreadMessage } from "@superchat/contracts";
-import { isPeerReceiptBlocks, isToolActivityBlock, projectMessageReactions } from "@superchat/core";
-import { cn, type GroupAvatarMember } from "@superchat/ui-web";
+import type { ThreadMessage } from "@superchat/contracts";
+import { isToolActivityBlock } from "@superchat/core";
+import { cn } from "@superchat/ui-web";
 import { ArrowDown } from "lucide-react";
 import {
   type ComponentProps,
@@ -16,7 +16,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { ActiveBotGlyph } from "../../../components/ai/CollaborationMarker";
 import {
   ReplyCardBotProvider,
   ReplyCardSendProvider,
@@ -89,35 +88,23 @@ const TranscriptView = memo(function Transcript({
   messages,
   olderCursor,
   loadingOlder,
-  answerableAskMessageId,
   running,
-  workingBots,
   onLoadOlder,
   onShowEarlier,
-  onOpenBot,
   onAnswer,
   onReply,
   onQuote,
-  onReact,
-  onJumpToMessage,
-  onOpenPeerMessages,
-  memberName,
-  peerBot,
-  onBotChanged,
-  voiceReady,
-  speakingMessageId,
-  onSpeak,
   onFork,
   renderUnder,
   aside,
 }: {
   museMode?: boolean;
   /** Muse mode: the face shown beside the Muse's replies. */
-  museFace?: { color: string; identity: string };
+  museFace: { color: string; identity: string };
   /** Muse mode: the Muse's own name, for first-run hint copy (`FirstRunHint`). */
   botDisplayName?: string;
-  /** Muse mode: the active bot's live runs, for the gutter face and bottom-of-transcript row. */
-  museRuns?: readonly MuseLiveRun[];
+  /** Muse mode: the turn in flight, for the gutter face and bottom-of-transcript row. */
+  museRuns: readonly MuseLiveRun[];
   /** Rendered at the top of the scrolling column, before the messages. */
   leading?: ReactNode;
   /** Rendered at the bottom of the scrolling column, after the messages. */
@@ -131,26 +118,14 @@ const TranscriptView = memo(function Transcript({
   messages: ThreadMessage[];
   olderCursor: number | string | null;
   loadingOlder: boolean;
-  answerableAskMessageId: string | null;
   running: boolean;
-  workingBots: GroupAvatarMember[];
   onLoadOlder: () => void | Promise<void>;
   /** The Conversation was cleared and its earlier history can be shown (the Muse only). */
   onShowEarlier?: () => void | Promise<void>;
-  onOpenBot: (botId: string) => void;
   onAnswer: (message: ThreadMessage, text: string, username?: string) => Promise<void>;
   /** Without reply/quote handlers (a Side Chat has no reply threads) those actions are hidden. */
   onReply?: (message: ThreadMessage) => void;
   onQuote?: (message: ThreadMessage, quote: string) => void;
-  onReact: (message: ThreadMessage, reaction: MessageReaction) => Promise<void>;
-  onJumpToMessage: (messageId: string) => void;
-  onOpenPeerMessages: (peer: { peerBotId: string; peerBotName: string }) => void;
-  memberName?: (botId: string | undefined) => string | undefined;
-  peerBot: (botId: string) => { color: string; status?: string } | undefined;
-  onBotChanged: () => Promise<void>;
-  voiceReady: boolean;
-  speakingMessageId: string | null;
-  onSpeak: (message: ThreadMessage) => void;
   /** Fork a message (ADR 0010): offered on the messages the engine can anchor a fork to. */
   onFork?: (message: ThreadMessage) => void;
   /** Rendered under a message (its forks); return null for nothing. */
@@ -160,8 +135,8 @@ const TranscriptView = memo(function Transcript({
 }) {
   const { t } = useLingui();
   const { label: museLiveLabel, runStartedAt } = useMuseLiveState({
-    botId: museFace?.identity ?? "",
-    runs: museRuns ?? [],
+    botId: museFace.identity,
+    runs: museRuns,
     messages,
   });
   const [atEnd, setAtEnd] = useState(true);
@@ -174,7 +149,6 @@ const TranscriptView = memo(function Transcript({
     () => new Map(messages.map((message) => [message.id, message])),
     [messages],
   );
-  const reactionView = useMemo(() => projectMessageReactions(messages), [messages]);
   // Muse: failed replies in a row read as one "3 failed attempts" line (failureNotes.ts).
   // Charts in a row (a dashboard reply) read as one set across the column.
   const group = useTranscriptGroup();
@@ -182,17 +156,12 @@ const TranscriptView = memo(function Transcript({
     () =>
       foldGroupRuns(
         museMode
-          ? foldFailureRuns(reactionView.visibleMessages)
-          : reactionView.visibleMessages.map((message) => ({ kind: "message", message })),
+          ? foldFailureRuns(messages)
+          : messages.map((message) => ({ kind: "message", message })),
         group,
       ),
-    [museMode, reactionView.visibleMessages, group],
+    [museMode, messages, group],
   );
-  const workingBotName = workingBots.length === 1 ? workingBots[0]?.name : undefined;
-  const workingLabel =
-    workingBotName != null && workingBotName !== ""
-      ? t`${workingBotName} is working`
-      : t`Bots are working`;
   const [quoteDraft, setQuoteDraft] = useState<{
     message: ThreadMessage;
     text: string;
@@ -479,132 +448,71 @@ const TranscriptView = memo(function Transcript({
           const { message } = row;
           if (!museMode && !message.blocks.some((block) => !isToolActivityBlock(block)))
             return null;
-          const peerReceipt = isPeerReceiptBlocks(message.blocks);
-          const messageReactions = reactionView.reactions.get(message.id);
           return (
             <div
               key={message.id}
               data-message-id={message.id}
-              className={peerReceipt ? "relative py-0.5" : "group/message relative hover:z-20"}
+              className="group/message relative hover:z-20"
             >
               <div
-                className={
-                  peerReceipt
-                    ? undefined
-                    : `relative flex ${message.role === "user" ? "justify-end" : "justify-start"}`
-                }
+                className={`relative flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div
-                  data-testid={peerReceipt ? undefined : "message-bubble-frame"}
-                  className={
-                    peerReceipt
-                      ? undefined
-                      : `relative w-fit min-w-0 ${
-                          message.role === "user"
-                            ? museMode
-                              ? "max-w-[80%]"
-                              : "max-w-[min(84%,calc(100%_-_6rem))]"
-                            : museMode
-                              ? "max-w-full"
-                              : "max-w-[min(88%,calc(100%_-_6rem))]"
-                        }`
-                  }
+                  data-testid="message-bubble-frame"
+                  className={`relative w-fit min-w-0 ${
+                    message.role === "user"
+                      ? museMode
+                        ? "max-w-[80%]"
+                        : "max-w-[min(84%,calc(100%_-_6rem))]"
+                      : museMode
+                        ? "max-w-full"
+                        : "max-w-[min(88%,calc(100%_-_6rem))]"
+                  }`}
                 >
-                  {peerReceipt ? null : (
-                    <MessageHoverActions
-                      message={message}
-                      side={message.role === "user" ? "start" : "end"}
-                      time={
-                        !museMode &&
-                        message.role === "user" &&
-                        !message.id.startsWith("progress:") ? (
-                          <time
-                            dateTime={message.createdAt}
-                            data-testid="message-hover-time"
-                            className="me-1 hidden text-xs tabular-nums whitespace-nowrap text-muted-foreground [@media(hover:hover)_and_(pointer:fine)]:block"
-                          >
-                            {new Date(message.createdAt).toLocaleTimeString(i18n.locale || "en", {
-                              hour: "numeric",
-                              minute: "2-digit",
-                            })}
-                          </time>
-                        ) : undefined
-                      }
-                      onReply={onReply}
-                      onReact={onReact}
-                      conversational={!museMode}
-                      onFork={
-                        onFork && message.forks !== undefined && forkAnchorFor(message, messages)
-                          ? (clicked) => {
-                              const anchor = forkAnchorFor(clicked, messages);
-                              if (anchor) onFork(anchor);
-                            }
-                          : undefined
-                      }
-                      above={Boolean(onFork)}
-                    />
-                  )}
+                  <MessageHoverActions
+                    message={message}
+                    side={message.role === "user" ? "start" : "end"}
+                    time={
+                      !museMode &&
+                      message.role === "user" &&
+                      !message.id.startsWith("progress:") ? (
+                        <time
+                          dateTime={message.createdAt}
+                          data-testid="message-hover-time"
+                          className="me-1 hidden text-xs tabular-nums whitespace-nowrap text-muted-foreground [@media(hover:hover)_and_(pointer:fine)]:block"
+                        >
+                          {new Date(message.createdAt).toLocaleTimeString(i18n.locale || "en", {
+                            hour: "numeric",
+                            minute: "2-digit",
+                          })}
+                        </time>
+                      ) : undefined
+                    }
+                    onReply={onReply}
+                    onFork={
+                      onFork && message.forks !== undefined && forkAnchorFor(message, messages)
+                        ? (clicked) => {
+                            const anchor = forkAnchorFor(clicked, messages);
+                            if (anchor) onFork(anchor);
+                          }
+                        : undefined
+                    }
+                    above={Boolean(onFork)}
+                  />
                   <MessageView
                     museMode={museMode}
                     botDisplayName={botDisplayName}
                     artifactTarget={artifactTarget}
                     message={message}
-                    canAnswer={
-                      message.id === answerableAskMessageId ||
-                      Boolean(museMode && hasOpenMuseAsk(message))
-                    }
-                    onOpenBot={onOpenBot}
-                    onOpenPeerMessages={onOpenPeerMessages}
+                    canAnswer={Boolean(museMode && hasOpenMuseAsk(message))}
                     onAnswer={onAnswer}
-                    speakerName={
-                      peerReceipt
-                        ? undefined
-                        : message.role === "bot"
-                          ? memberName?.(message.botId)
-                          : undefined
-                    }
-                    memberName={memberName}
-                    peerBot={peerBot}
-                    replyPreview={
-                      message.replyToMessageId
-                        ? messageById.get(message.replyToMessageId)
-                        : undefined
-                    }
-                    replyToMessageId={message.replyToMessageId}
-                    onJumpToMessage={onJumpToMessage}
-                    onBotChanged={onBotChanged}
-                    voiceReady={voiceReady}
-                    speaking={speakingMessageId === message.id}
-                    onSpeak={() => onSpeak(message)}
                   />
-                  {museMode &&
-                  !peerReceipt &&
-                  message.role === "user" &&
-                  !message.id.startsWith("progress:") ? (
+                  {museMode && message.role === "user" && !message.id.startsWith("progress:") ? (
                     <UserMessageMeta message={message} />
                   ) : null}
                 </div>
               </div>
-              {peerReceipt ? null : renderUnder?.(message)}
-              {!peerReceipt && messageReactions ? (
-                <div
-                  data-testid="message-reactions"
-                  className={cn(
-                    "mt-1 flex flex-wrap gap-1",
-                    message.role === "user" && "justify-end",
-                  )}
-                >
-                  {[...messageReactions].map(([emoji, count]) => (
-                    <span
-                      key={emoji}
-                      className="rounded-full border border-border bg-muted px-2 py-0.5 text-xs"
-                    >
-                      {emoji}
-                      {count > 1 ? ` ${count}` : ""}
-                    </span>
-                  ))}
-                </div>
-              ) : null}
+              {renderUnder?.(message)}
             </div>
           );
         })}
@@ -617,13 +525,9 @@ const TranscriptView = memo(function Transcript({
                 block.kind === "progress" && !isToolActivityBlock(block) && Boolean(block.text),
             ),
         ) ? (
-          museMode && museFace ? (
-            museLiveLabel ? (
-              <WorkingRow label={museLiveLabel} startedAt={runStartedAt} />
-            ) : null
-          ) : (
-            <ActiveBotGlyph bots={workingBots} label={workingLabel} />
-          )
+          museLiveLabel ? (
+            <WorkingRow label={museLiveLabel} startedAt={runStartedAt} />
+          ) : null
         ) : null}
         {trailing}
       </div>

@@ -9,6 +9,7 @@ import { Download, Ellipsis, Maximize2 } from "lucide-react";
 import { Fragment } from "react";
 import { artifactKind, kindLabel } from "../../../lib/artifact-kind";
 import { formatRelativeTime } from "../../../lib/relative-time";
+import { readableFileName } from "../ArtifactFileCard";
 import { ArtifactPreviewCard, GlassAction, glassActionClassName } from "../ArtifactPreviewCard";
 import { useArtifactCardParts } from "../registry";
 import { LibraryArt } from "./LibraryArt";
@@ -19,16 +20,17 @@ export function LibraryCard({
   onOpen,
   onDownload,
   onDelete,
-  showVisibility = false,
 }: {
   artifact: ArtifactSummary;
   onOpen: () => void;
   onDownload: () => void;
   onDelete: () => void;
-  showVisibility?: boolean;
 }) {
   const { t } = useLingui();
   const kind = artifactKind(artifact.mimeType, artifact.name);
+  // The title the Muse gave it when saving, else its file name made readable ("tea.deck.html"
+  // reads "Tea").
+  const title = artifact.description?.trim() || readableFileName(artifact.name);
   const extra = useArtifactCardParts(artifact);
   const badges = extra.filter((part) => part.badge);
   const meta = [
@@ -42,12 +44,12 @@ export function LibraryCard({
     <ArtifactPreviewCard
       size="grid"
       artifact={artifact}
-      title={artifact.name}
+      title={title}
       meta={meta}
       badge={
         badges.length ? (
           badges.map((part, index) => <Fragment key={index}>{part.badge}</Fragment>)
-        ) : showVisibility && !artifact.publish ? (
+        ) : kind === "page" && !artifact.publish ? (
           <span
             data-testid="private-pill"
             className="inline-flex shrink-0 items-center rounded-full bg-popover/85 px-2 py-0.5 text-[11px] font-medium text-foreground backdrop-blur-sm"
@@ -56,16 +58,16 @@ export function LibraryCard({
           </span>
         ) : null
       }
-      buttonLabel={t`Open ${artifact.name}`}
+      buttonLabel={t`Open ${title}`}
       onOpen={onOpen}
       testId="library-card"
-      fallback={<LibraryArt kind={kind} name={artifact.name} />}
+      fallback={<LibraryArt kind={kind} name={title} />}
       actions={
         <>
-          <GlassAction label={t`Open ${artifact.name}`} onClick={onOpen}>
+          <GlassAction label={t`Open ${title}`} onClick={onOpen}>
             <Maximize2 size={13} strokeWidth={1.9} />
           </GlassAction>
-          <GlassAction label={t`Download ${artifact.name}`} onClick={onDownload}>
+          <GlassAction label={t`Download ${title}`} onClick={onDownload}>
             <Download size={13} strokeWidth={1.9} />
           </GlassAction>
           <DropdownMenu>
@@ -73,7 +75,7 @@ export function LibraryCard({
               render={
                 <button
                   type="button"
-                  aria-label={t`More actions for ${artifact.name}`}
+                  aria-label={t`More actions for ${title}`}
                   onClick={(event) => event.stopPropagation()}
                   className={glassActionClassName}
                 />
