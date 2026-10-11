@@ -143,10 +143,65 @@ describe("artifacts", () => {
     });
   });
 
+  it("restores an earlier version as a new one", async () => {
+    let posted = "";
+    engine((url, init) => {
+      posted = `${init?.method} ${url.pathname}`;
+      return json({ ...row, id: "a3", version: 3, origin: "restore" });
+    });
+    const created = await call(artifactsRouter.artifacts.restore, { artifactId: "a0" });
+    expect(posted).toBe("POST /v1/artifacts/a0/restore");
+    expect(created).toMatchObject({ id: "a3", version: 3, botId: "sess-1" });
+  });
+
   it("maps an engine 404 to not-found", async () => {
     engine(() => json({ error: { code: "not_found" } }, 404));
     await expect(
       call(artifactsRouter.artifacts.getById, { artifactId: "zz" }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+});
+
+describe("artifact edit", () => {
+  const patches = [{ kind: "set-text" as const, id: "title", text: "B" }];
+  const edit = (input: { patches: unknown[] } = { patches }) =>
+    call(artifactsRouter.artifacts.edit, { artifactId: "a1", baseVersion: 1, ...input } as never);
+
+  it("patches and returns the new manual version", async () => {
+    const fetchMock = vi.fn(async (url: URL, init?: RequestInit) => {
+      expect(url.pathname).toBe("/v1/artifacts/a1/edit");
+      expect(init?.method).toBe("PATCH");
+      return json({ ...row, id: "a3", version: 2 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await edit()).toMatchObject({ id: "a3" });
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      base_version: 1,
+      patches,
+    });
+  });
+
+  it("maps a stale base and an inexact patch to CONFLICT, telling them apart by code", async () => {
+    const refuse = (code: string) =>
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => json({ error: { code, message: "refused" } }, 409)),
+      );
+    refuse("artifact_stale");
+    await expect(edit()).rejects.toMatchObject({
+      code: "CONFLICT",
+      data: { code: "artifact_stale" },
+    });
+    refuse("conflict");
+    await expect(edit()).rejects.toMatchObject({ code: "CONFLICT", data: { code: "conflict" } });
+  });
+
+  it("sends a set-theme patch as an ordinary edit", async () => {
+    const themePatches = [{ kind: "set-theme" as const, theme: "nord" }];
+    const fetchMock = vi.fn(async () => json({ ...row, id: "a3", version: 2 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await edit({ patches: themePatches });
+    const init = (fetchMock.mock.calls as unknown as [URL, RequestInit][])[0]?.[1];
+    expect(JSON.parse(String(init?.body)).patches).toEqual(themePatches);
   });
 });

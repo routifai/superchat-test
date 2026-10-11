@@ -6,11 +6,14 @@ import {
   bytesToBase64,
   createChatOwnershipResolver,
   deleteOmnigentArtifact,
+  editOmnigentArtifact,
   fetchOmnigentArtifactContent,
   getOmnigentArtifact,
   listOmnigentArtifacts,
+  OmnigentApiError,
   type OmnigentArtifact,
   type OmnigentPublication,
+  restoreOmnigentArtifact,
 } from "@superchat/adapters/omnigent/browser";
 import type { Artifact, ArtifactPublish } from "@superchat/contracts";
 import { engineClient, museSessionId, NO_EMAIL } from "./client";
@@ -126,6 +129,44 @@ export const artifactsRouter = {
         ...toArtifact(detail, (await ownerOf(detail.parent_session_id)) ?? null),
         contentBase64: bytesToBase64(bytes),
       };
+    }),
+    restore: os.artifacts.restore.handler(async ({ input }) => {
+      const created = await restoreOmnigentArtifact(
+        engineClient(),
+        NO_EMAIL,
+        input.artifactId,
+      ).catch(notFound);
+      const ownerOf = await ownerResolver();
+      return toArtifact(created, (await ownerOf(created.parent_session_id)) ?? null);
+    }),
+    // A stale base (`artifact_stale`) and a patch the engine will not apply exactly (`conflict`)
+    // are both CONFLICT; `data.code` tells the editor which (it reloads, or offers superchat).
+    edit: os.artifacts.edit.handler(async ({ input }) => {
+      try {
+        const created = await editOmnigentArtifact(
+          engineClient(),
+          NO_EMAIL,
+          input.artifactId,
+          input.baseVersion,
+          input.patches,
+        );
+        return toArtifact(created, null);
+      } catch (error) {
+        if (error instanceof OmnigentApiError) {
+          if (error.code === "artifact_stale" || error.code === "conflict") {
+            throw new ORPCError("CONFLICT", {
+              message: error.detail ?? "That edit couldn't be saved.",
+              data: { code: error.code },
+            });
+          }
+          if (error.code === "invalid_input") {
+            throw new ORPCError("BAD_REQUEST", {
+              message: error.detail ?? "That edit isn't allowed.",
+            });
+          }
+        }
+        return notFound(error);
+      }
     }),
     remove: os.artifacts.remove.handler(async ({ input }) => {
       await deleteOmnigentArtifact(engineClient(), NO_EMAIL, input.artifactId).catch(notFound);

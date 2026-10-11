@@ -1,14 +1,15 @@
 import { useLingui } from "@lingui/react/macro";
-import type { Artifact, DeckPatch, DeckTheme } from "@superchat/contracts";
+import type { Artifact, DeckTheme, HtmlPatch } from "@superchat/contracts";
 import { Button, cn } from "@superchat/ui-web";
 import { Check, Expand, Undo2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type DeckThemesSource, loadDeckThemes, resetDeckThemeCache } from "../../lib/deck-themes";
 import { rpc } from "../../lib/rpc";
+import { flushEditorEdits, noteOwnVersion } from "../artifacts/editor/editor-state";
+import { editConflict } from "../artifacts/editor/html/edit-model";
+import type { HtmlEditSource } from "../artifacts/editor/html/useHtmlEditor";
 import { DeckThemePreview } from "./DeckThemePreview";
-import { flushDeckEdits, noteDeckVersionEdit, setDeckThemeOpen } from "./deck-ui-state";
-import { isInexact, isStale } from "./edit/edit-model";
-import type { DeckEditSource } from "./edit/useDeckEditor";
+import { setDeckThemeOpen } from "./deck-ui-state";
 
 export type { DeckThemesSource };
 /** The id of the theme a saved deck is on, or null when it is hand-made. */
@@ -17,7 +18,7 @@ export type DeckThemeSource = (artifactId: string) => Promise<string | null>;
 
 const defaultCurrent: DeckThemeSource = async (artifactId) =>
   (await rpc.decks.theme({ artifactId })).theme;
-const defaultEdit: DeckEditSource = (input) => rpc.decks.edit(input);
+const defaultEdit: HtmlEditSource = (input) => rpc.artifacts.edit(input);
 
 /** The data-attribute the header's Theme button carries: a click on it is not an "outside" click
  * (it toggles the gallery itself) and focus returns to it when the gallery closes. */
@@ -49,7 +50,7 @@ export function DeckThemePicker({
   onEdited?: (artifactId: string) => void;
   themesSource?: DeckThemesSource;
   themeSource?: DeckThemeSource;
-  editSource?: DeckEditSource;
+  editSource?: HtmlEditSource;
   /** The deck's frame: only its ready message brings the keyboard back to the gallery. */
   frameRef?: React.RefObject<HTMLIFrameElement | null>;
 }) {
@@ -187,27 +188,27 @@ export function DeckThemePicker({
   };
 
   const failure = (cause: unknown): string => {
-    const message = cause instanceof Error ? cause.message : "";
-    if (isInexact(message))
+    const conflict = editConflict(cause);
+    if (conflict === "inexact")
       return t`This deck can't be restyled by hand. Ask superchat to restyle it.`;
-    if (isStale(message)) return t`The deck changed since you opened it. Try again.`;
+    if (conflict === "stale") return t`The deck changed since you opened it. Try again.`;
     return t`Couldn't switch the theme.`;
   };
 
   const send = async (
-    patches: DeckPatch[],
+    patches: HtmlPatch[],
     onDone: (created: Pick<Artifact, "id" | "version">) => void,
   ) => {
     setError(null);
     try {
       // Whatever the editor still has staged is saved first, so the switch builds on it.
-      const head = (await flushDeckEdits(deckKey)) ?? artifact;
+      const head = (await flushEditorEdits(deckKey)) ?? artifact;
       const created = await editSource({
         artifactId: head.id,
         baseVersion: head.version,
         patches,
       });
-      noteDeckVersionEdit(deckKey, created.version);
+      noteOwnVersion(deckKey, created.version);
       onDone(created);
       onEdited?.(created.id);
     } catch (cause) {

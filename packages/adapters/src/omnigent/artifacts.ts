@@ -123,6 +123,59 @@ export async function deleteOmnigentArtifact(
   await throwOnError(response, "delete artifact", config.secrets);
 }
 
+/** `POST /v1/artifacts/{id}/restore` — makes that earlier version the newest again (a new
+ * `restore` version with its bytes); returns the new version. */
+export async function restoreOmnigentArtifact(
+  config: OmnigentClientConfig,
+  email: string,
+  id: string,
+): Promise<OmnigentArtifact> {
+  const response = await fetch(artifactUrl(config, id, "/restore"), {
+    method: "POST",
+    headers: omnigentHeaders(config, email),
+  });
+  await throwOnError(response, "restore artifact", config.secrets);
+  return (await response.json()) as OmnigentArtifact;
+}
+
+/** One source patch (engine wire format; see engine superchat/decks/patches.py). */
+export type OmnigentHtmlPatch =
+  | { kind: "set-text"; id: string; text: string }
+  | {
+      kind: "set-style";
+      id: string;
+      style: Record<string, string | null>;
+      before?: Record<string, string>;
+    }
+  | {
+      kind: "set-attributes";
+      id: string;
+      attributes: { href?: string | null; alt?: string | null };
+    }
+  | { kind: "remove-element"; id: string }
+  | { kind: "duplicate-element"; id: string }
+  | { kind: "set-theme"; theme: string }
+  | { kind: "set-full-source"; source: string };
+
+/** `PATCH /v1/artifacts/{id}/edit` — hand edits of an HTML file (a deck, a page) as source
+ * patches, saved as a new `manual` version. Fails with `artifact_stale` when `baseVersion` is no
+ * longer the newest, `conflict` when a patch cannot be applied exactly. */
+export async function editOmnigentArtifact(
+  config: OmnigentClientConfig,
+  email: string,
+  id: string,
+  baseVersion: number,
+  patches: OmnigentHtmlPatch[],
+): Promise<OmnigentArtifact> {
+  const response = await fetch(artifactUrl(config, id, "/edit"), {
+    method: "PATCH",
+    headers: omnigentHeaders(config, email),
+    body: JSON.stringify({ base_version: baseVersion, patches }),
+  });
+  await throwOnError(response, "edit artifact", config.secrets);
+  return (await response.json()) as OmnigentArtifact;
+}
+
 /** `POST /v1/artifacts` — saves bytes as the next version of `name` in a Conversation. */
 export async function createOmnigentArtifact(
   config: OmnigentClientConfig,
