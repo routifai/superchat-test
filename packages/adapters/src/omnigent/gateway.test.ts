@@ -125,21 +125,6 @@ describe("runTurnOnOmnigent", () => {
     expect(events.finalizeRun).not.toHaveBeenCalled();
   });
 
-  it("runs a skill test run as an ordinary engine turn", async () => {
-    const prisma = fakePrisma({
-      run: {
-        findUnique: vi.fn(async () => ({ ...RUN, trigger: "skill" })),
-        updateMany: vi.fn(async () => ({ count: 0 })),
-      },
-    });
-    const result = await runTurnOnOmnigent(
-      { prisma, events: fakeEvents(), ...DEPS_BASE },
-      "run-1",
-      "worker-1",
-    );
-    expect(result).toBe(true);
-  });
-
   it("fails a run the engine cannot handle once, without touching the engine", async () => {
     const prisma = fakePrisma({
       run: {
@@ -198,6 +183,36 @@ describe("runTurnOnOmnigent", () => {
       "America/Toronto",
     );
     expect(postOmnigentMessage).toHaveBeenCalled();
+  });
+
+  it("re-sends the turn once when the engine answers wrong_replica", async () => {
+    postOmnigentMessage.mockRejectedValueOnce(new OmnigentApiError("400", "wrong_replica"));
+    streamOmnigentSession.mockReturnValue(
+      eventsFrom([
+        { type: "session.status", data: { status: "running" } },
+        {
+          type: "response.completed",
+          response: {
+            output: [
+              {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "Hi" }],
+              },
+            ],
+          },
+        },
+      ]),
+    );
+
+    const result = await runTurnOnOmnigent(
+      { prisma: fakePrisma(), events: fakeEvents(), ...DEPS_BASE },
+      "run-1",
+      "worker-1",
+    );
+
+    expect(result).toBe(true);
+    expect(postOmnigentMessage).toHaveBeenCalledTimes(2);
   });
 
   it("claims, resolves the Muse on the engine, posts the turn, and finalizes on response.completed", async () => {

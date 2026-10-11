@@ -25,7 +25,7 @@ fill() { [[ -n "$(env_get "$1")" ]] || env_set "$1" "$2"; }
 
 # Secrets, and any model key this shell already has.
 fill POSTGRES_PASSWORD "$(openssl rand -hex 16)"
-for key in BETTER_AUTH_SECRET ENCRYPTION_KEY SCREEN_PROXY_SECRET OMNIGENT_PROXY_SECRET; do
+for key in BETTER_AUTH_SECRET ENCRYPTION_KEY OMNIGENT_PROXY_SECRET; do
   fill "$key" "$(openssl rand -hex 32)"
 done
 fill OMNIGENT_VAULT_KEY "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
@@ -35,8 +35,9 @@ done
 [[ -n "$(env_get ANTHROPIC_API_KEY)$(env_get LITELLM_BASE_URL)" ]] ||
   echo "warning: set ANTHROPIC_API_KEY (or LITELLM_BASE_URL + LITELLM_API_KEY) in .env for the engine." >&2
 
-"${compose[@]}" build
-# Only the running services: the build-only ones (omnigent-server, omnigent-host, computer) exit at
-# once, which --wait would report as a failure.
-"${compose[@]}" up -d --wait --wait-timeout 300 postgres omnigent api worker web
+# Base images and the Computer image first (the "build" profile keeps them out of `up`), then the
+# engine on top of its base, and the app.
+"${compose[@]}" --profile build build omnigent-server ubuntu-python omnigent-host computer
+"${compose[@]}" build omnigent app
+"${compose[@]}" up -d --wait --wait-timeout 300
 echo "Superchat is running: http://127.0.0.1:$(env_get SUPERCHAT_WEB_PORT | grep . || echo 5173)"

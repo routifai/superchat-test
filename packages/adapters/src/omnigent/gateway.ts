@@ -3,7 +3,7 @@
 // Muse's own private Conversation thread (never a routine, Goal-log, group thread, or messaging
 // channel run) is eligible — everything else falls back to the existing engine untouched.
 //
-// This intentionally skips the full run-executor lease machinery (computer leases, takeover,
+// This intentionally skips the full run-executor lease machinery (computer leases,
 // heartbeats): those exist to coordinate sandboxed tool execution the Omnigent harness does not
 // use here. It still claims the run with the same fence/lease columns and finishes through
 // `ThreadEvents.finalizeRun` so the thread, task, and run rows land in the same state a normal
@@ -107,9 +107,9 @@ export interface OmnigentGatewayDeps {
   config?: OmnigentSuperChatConfig;
 }
 
-/** Triggers the engine runs as an ordinary turn: a typed message, a Teach "Test" run (the
- * skill's instructions are the prompt) and a follow-up such as an Idea's "Do it". */
-const ENGINE_RUN_TRIGGERS: ReadonlySet<string> = new Set(["user", "skill", "follow_up"]);
+/** Triggers the engine runs as an ordinary turn: a typed message and a follow-up such as an
+ * Idea's "Do it". */
+const ENGINE_RUN_TRIGGERS: ReadonlySet<string> = new Set(["user", "follow_up"]);
 
 /**
  * Fails a queued run the engine cannot handle (goal threads, routines, webhooks, ...) once and
@@ -580,9 +580,19 @@ async function postTurn(
   // The Computer reads the referenced files when the turn starts and puts their framed text in
   // front of the message for the model only; it is never part of the stored message.
   const sent = text;
-  return images.length
-    ? postOmnigentMessage(client, email, sessionId, sent, images)
-    : postOmnigentMessage(client, email, sessionId, sent);
+  const post = () =>
+    images.length
+      ? postOmnigentMessage(client, email, sessionId, sent, images)
+      : postOmnigentMessage(client, email, sessionId, sent);
+  try {
+    return await post();
+  } catch (error) {
+    // The engine's `wrong_replica` contract: re-send once. It is raised before anything is stored
+    // (so the retry is never a double send), e.g. when the Computer is still registered from before
+    // an engine restart; the retry takes the path that relaunches its runner.
+    if (!(error instanceof OmnigentApiError) || error.code !== "wrong_replica") throw error;
+    return post();
+  }
 }
 
 interface TurnContext {
