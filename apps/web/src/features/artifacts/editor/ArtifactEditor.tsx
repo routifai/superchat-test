@@ -12,7 +12,6 @@ import {
   Download,
   ExternalLink,
   Maximize2,
-  MessageSquare,
   Minimize2,
   Pencil,
   Redo2,
@@ -37,7 +36,7 @@ import {
   useArtifactEditorKind,
   type useArtifactPanelParts,
 } from "../registry";
-import { artifactKey, setArtifactEditing, useArtifactEditing } from "./editor-state";
+import { artifactKey, isHandOrigin, setArtifactEditing, useArtifactEditing } from "./editor-state";
 import { buildFileAsk } from "./html-ask";
 import { VersionMenu } from "./VersionMenu";
 
@@ -386,7 +385,7 @@ function LoadedEditor({
           data-testid="artifact-arrived"
           className="shrink-0 truncate text-[12px] text-foreground"
         >
-          {content.arrived.origin === "manual" || content.arrived.origin === "restore"
+          {isHandOrigin(content.arrived.origin)
             ? t`Updated by you · v${content.arrived.version}`
             : t`Updated by superchat · v${content.arrived.version}`}
         </span>
@@ -436,15 +435,6 @@ function LoadedEditor({
           >
             <Redo2 />
           </Button>
-          {ask.available ? (
-            <>
-              <span aria-hidden="true" className="mx-1 h-4 w-px bg-border" />
-              <Button variant="ghost" size="sm" className="rounded-full" onClick={props.focusAsk}>
-                <MessageSquare />
-                {t`Ask superchat`}
-              </Button>
-            </>
-          ) : null}
           <Button size="sm" className="ms-1 rounded-full" onClick={() => setEditing(false)}>
             <Check />
             {t`Done`}

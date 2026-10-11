@@ -1,4 +1,3 @@
-import { userVisibleMessages } from "@superchat/core";
 import { useMemo, useRef } from "react";
 import type { ArtifactTarget } from "../../lib/artifact-open";
 import { useTurnRuns } from "../../pages/muse/chrome/useMuseLiveState";
@@ -24,16 +23,11 @@ export const sideChatView: Omit<SideChatView, "Approvals"> = {
     bot,
   }) {
     const scrollRef = useRef<HTMLDivElement>(null);
-    const visible = useMemo(
-      () => userVisibleMessages(messages, { includePeerReceipts: true }),
-      [messages],
-    );
     const runs = useTurnRuns(`side-chat:${bot.id}`, running);
     const artifactTarget = useMemo<ArtifactTarget>(() => ({ botId: bot.id }), [bot.id]);
     const museFace = useMemo(() => ({ color: bot.color, identity: bot.id }), [bot.color, bot.id]);
     return (
       <Transcript
-        museMode
         botDisplayName={bot.name}
         museFace={museFace}
         museRuns={runs}
@@ -44,7 +38,7 @@ export const sideChatView: Omit<SideChatView, "Approvals"> = {
         scrollRequest={scrollRequest ?? null}
         onScrollRequestHandled={noop}
         artifactTarget={artifactTarget}
-        messages={visible}
+        messages={messages}
         olderCursor={null}
         loadingOlder={false}
         running={running}
@@ -56,7 +50,6 @@ export const sideChatView: Omit<SideChatView, "Approvals"> = {
   Composer: function SideChatComposer({ placeholder, sending, onSend }) {
     return (
       <Composer
-        museMode
         activeName=""
         placeholder={placeholder}
         sending={sending}

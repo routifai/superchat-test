@@ -1,14 +1,6 @@
 import { useLingui } from "@lingui/react/macro";
 import type { ThreadMessage } from "@superchat/contracts";
-import {
-  type ComposerMention,
-  clampMentionHighlightIndex,
-  mentionChipKey,
-  resolveMentionPickerKey,
-  SLASH_ACTIONS,
-  type SlashActionId,
-  serializeComposerPrompt,
-} from "@superchat/core";
+import { SLASH_ACTIONS, type SlashActionId } from "@superchat/core";
 import {
   Button,
   cn,
@@ -35,7 +27,6 @@ import {
   memo,
   type RefObject,
   useEffect,
-  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -51,7 +42,6 @@ import {
 } from "../../../lib/composer-attachments";
 import { isFileDrag, isFilePaste } from "../../../lib/pending-attachments";
 import { useFailureNoteAction, useFailureNoteText } from "./FailureNote";
-import { MentionChipIcon, MentionOptionIcon } from "./MentionIcons";
 import { previewMessageText } from "./messageText";
 import {
   ATTACHMENT_ACCEPT,
@@ -64,7 +54,6 @@ import { slashActionLabel } from "./slashActionLabel";
 const NO_FOLDERS: readonly string[] = [];
 
 export const Composer = memo(function Composer({
-  museMode,
   activeName,
   running,
   pendingAttachments = NO_ATTACHMENTS,
@@ -88,12 +77,10 @@ export const Composer = memo(function Composer({
   replyQuote,
   replyTargetName,
   onClearReply,
-  mentionTargets,
   onSlashAction,
   seedText,
   onSeedConsumed,
 }: {
-  museMode?: boolean;
   activeName?: string;
   running: boolean;
   pendingAttachments?: PendingAttachment[];
@@ -116,7 +103,7 @@ export const Composer = memo(function Composer({
   onRemoveAttachment?: (attachment: PendingAttachment) => void;
   onRetryAttachment?: (attachment: PendingAttachment) => void;
   /** Resolves `false` when nothing was sent, so the composer gives the person's words back. */
-  onSend: (text: string, mentions?: ComposerMention[]) => Promise<boolean | undefined | void>;
+  onSend: (text: string) => Promise<boolean | undefined | void>;
   onStop?: () => Promise<void>;
   /** Overrides the "Message {name}" placeholder. */
   placeholder?: string;
@@ -124,7 +111,6 @@ export const Composer = memo(function Composer({
   replyQuote?: string | null;
   replyTargetName?: string;
   onClearReply?: () => void;
-  mentionTargets?: ComposerMention[];
   onSlashAction?: (action: SlashActionId) => void;
   /** First-run "Try it" chips (muse/intro): fills the draft and focuses it, fill-then-send. */
   seedText?: string | null;
@@ -134,17 +120,13 @@ export const Composer = memo(function Composer({
   const [draft, setDraft] = useState("");
   useComposerAttachTarget();
   const attachments = useComposerAttachments();
-  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
-  const [mentionHighlightIndex, setMentionHighlightIndex] = useState(0);
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
-  const [selectedMentions, setSelectedMentions] = useState<ComposerMention[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [replyAnnouncement, setReplyAnnouncement] = useState("");
   // What the live region currently holds — a send disarming the reply clears
   // "reply" text, while an explicit cancel must keep "Reply cancelled".
   const replyAnnouncementKind = useRef<"reply" | "cancelled" | null>(null);
   const prevReplyTarget = useRef<ThreadMessage | null>(null);
-  const mentionListboxId = useId();
   const dragDepth = useRef(0);
   const [draggingFiles, setDraggingFiles] = useState(false);
   // A failed turn the person can fix themselves: the note offers where (Settings > Models).
@@ -153,10 +135,7 @@ export const Composer = memo(function Composer({
   const failureNote = failure ? failureText(failure.code) : null;
   const fix = failure ? failureAction(failure.code) : null;
   const canSend =
-    draft.trim().length > 0 ||
-    selectedMentions.length > 0 ||
-    pendingAttachments.length > 0 ||
-    pendingFolders.length > 0;
+    draft.trim().length > 0 || pendingAttachments.length > 0 || pendingFolders.length > 0;
   // A file still being read, or one that failed, holds Send until it is ready, removed or retried.
   const attachmentsPending = attachmentsBlockSend(pendingAttachments);
 
@@ -187,8 +166,6 @@ export const Composer = memo(function Composer({
 
   function updateDraft(value: string) {
     setDraft(value);
-    const mentionMatch = /(?:^|\s)@([\w-]*)$/.exec(value);
-    setMentionQuery(mentionMatch ? (mentionMatch[1] ?? "") : null);
     // `/` only at the start of the draft.
     const slashMatch = /^\/([^\n]*)$/.exec(value);
     setSlashQuery(slashMatch ? (slashMatch[1] ?? "") : null);
@@ -208,48 +185,11 @@ export const Composer = memo(function Composer({
     onSeedConsumed?.();
   }, [seedText]);
 
-  function insertMention(mention: ComposerMention) {
-    setDraft((current) => current.replace(/@([\w-]*)$/, ""));
-    setMentionQuery(null);
-    setMentionHighlightIndex(0);
-    setSelectedMentions((current) =>
-      current.some((selected) => mentionChipKey(selected) === mentionChipKey(mention))
-        ? current
-        : [...current, mention],
-    );
-    focusComposer();
-  }
-
   function runSlashAction(action: SlashActionId) {
     setDraft("");
     setSlashQuery(null);
     onSlashAction?.(action);
   }
-
-  function removeLastChip() {
-    setSelectedMentions((current) => current.slice(0, -1));
-  }
-
-  const mentionOptions = useMemo(() => {
-    if (mentionQuery === null || !mentionTargets?.length) return [];
-    const query = mentionQuery.trim().toLowerCase();
-    return mentionTargets
-      .filter((target) => !query || target.name.toLowerCase().startsWith(query))
-      .slice(0, 10);
-  }, [mentionQuery, mentionTargets]);
-
-  useEffect(() => {
-    setMentionHighlightIndex(0);
-  }, [mentionQuery, mentionOptions]);
-
-  const activeMentionIndex = clampMentionHighlightIndex(
-    mentionHighlightIndex,
-    mentionOptions.length,
-  );
-  const mentionPickerOpen = mentionOptions.length > 0;
-  const activeMentionOptionId = mentionPickerOpen
-    ? `${mentionListboxId}-option-${activeMentionIndex}`
-    : undefined;
 
   const slashActionOptions = useMemo(() => {
     if (slashQuery === null) return [];
@@ -257,25 +197,19 @@ export const Composer = memo(function Composer({
     return SLASH_ACTIONS.filter((action) => !query || action.label.toLowerCase().includes(query));
   }, [slashQuery]);
 
-  const showSlashPicker =
-    slashQuery !== null && mentionQuery === null && slashActionOptions.length > 0;
+  const showSlashPicker = slashQuery !== null && slashActionOptions.length > 0;
 
   function send() {
     if (!canSend || sending || attachmentsPending) return;
-    const text = serializeComposerPrompt(draft, null, selectedMentions);
-    const kept = { draft, mentions: selectedMentions, attachments };
+    const text = draft.replace(/^\s+/, "").trimEnd();
+    const kept = { draft, attachments };
     setDraft("");
-    setMentionQuery(null);
-    setMentionHighlightIndex(0);
     setSlashQuery(null);
-    const mentions = selectedMentions;
-    setSelectedMentions([]);
     clearComposerAttachments();
-    void onSend(withComposerAttachments(text, attachments), mentions).then((sent) => {
+    void onSend(withComposerAttachments(text, attachments)).then((sent) => {
       if (sent !== false) return;
       // The send failed (the Computer never started, say): nothing is lost.
       setDraft((current) => (current ? current : kept.draft));
-      setSelectedMentions((current) => (current.length ? current : kept.mentions));
       for (const item of kept.attachments) setComposerAttachment(item.kind, item);
     });
   }
@@ -329,7 +263,7 @@ export const Composer = memo(function Composer({
     });
   }
 
-  const showComposerPlaceholder = draft.length === 0 && selectedMentions.length === 0;
+  const showComposerPlaceholder = draft.length === 0;
   const replyName = replyTarget ? (replyTargetName ?? previewMessageText(replyTarget)) : "";
   const replyNameRef = useRef(replyName);
   replyNameRef.current = replyName;
@@ -380,7 +314,7 @@ export const Composer = memo(function Composer({
       onDrop={handleDrop}
       className={cn(
         "relative z-30 m-0 min-w-0 border-0 px-3 pb-4 pt-3 md:px-6 md:pb-6",
-        museMode && "mx-auto w-full max-w-[748px] pt-2 md:pb-[18px]",
+        "mx-auto w-full max-w-[748px] pt-2 md:pb-[18px]",
         draggingFiles && "rounded-[14px] ring-2 ring-inset ring-ring",
       )}
     >
@@ -575,48 +509,6 @@ export const Composer = memo(function Composer({
           ))}
         </div>
       ) : null}
-      {mentionPickerOpen ? (
-        <div
-          id={mentionListboxId}
-          role="listbox"
-          aria-label={t`Mentions`}
-          data-testid="mention-picker"
-          className="mb-2 overflow-hidden rounded-[14px] border border-border bg-muted"
-        >
-          {mentionOptions.map((mention, index) => {
-            const optionId = `${mentionListboxId}-option-${index}`;
-            const highlighted = index === activeMentionIndex;
-            return (
-              <button
-                id={optionId}
-                key={mentionChipKey(mention)}
-                type="button"
-                role="option"
-                aria-selected={highlighted}
-                aria-label={t`@${mention.name}`}
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => insertMention(mention)}
-                onMouseEnter={() => setMentionHighlightIndex(index)}
-                className={`flex w-full items-start gap-3 px-4 py-2.5 text-start hover:bg-accent ${
-                  highlighted ? "bg-accent" : ""
-                }`}
-              >
-                <MentionOptionIcon mention={mention} />
-                <span className="min-w-0">
-                  <span dir="auto" className="block text-[14px] text-foreground">
-                    @{mention.name}
-                  </span>
-                  {mention.subtitle ? (
-                    <span dir="auto" className="block truncate text-[12.5px] text-muted-foreground">
-                      {mention.subtitle}
-                    </span>
-                  ) : null}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
       {showSlashPicker ? (
         <div
           data-testid="slash-picker"
@@ -643,9 +535,7 @@ export const Composer = memo(function Composer({
         data-testid="composer-bar"
         className={cn(
           "flex gap-3.5 border border-border bg-background py-[9px] pe-2.5 ps-3 transition-[border-color,box-shadow] duration-150 focus-within:border-ring",
-          museMode
-            ? "sc-composer min-h-[108px] flex-wrap content-between items-end gap-x-1.5 gap-y-2 rounded-[20px] px-3 pt-3.5 pb-2.5"
-            : "items-center rounded-full",
+          "sc-composer min-h-[108px] flex-wrap content-between items-end gap-x-1.5 gap-y-2 rounded-[20px] px-3 pt-3.5 pb-2.5",
         )}
       >
         {onAttachmentPick ? (
@@ -685,9 +575,7 @@ export const Composer = memo(function Composer({
                 onClick={() => fileInputRef?.current?.click()}
                 className={cn(
                   "size-8 shrink-0 rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
-                  museMode
-                    ? "size-[34px] border-0 bg-transparent text-ink-3"
-                    : "border border-border bg-muted",
+                  "size-[34px] border-0 bg-transparent text-ink-3",
                 )}
               >
                 <Plus size={16} strokeWidth={2} />
@@ -698,110 +586,39 @@ export const Composer = memo(function Composer({
         <div
           className={cn(
             "flex min-w-0 flex-1 flex-wrap items-end gap-1.5",
-            museMode && "order-first basis-full px-1.5",
+            "order-first basis-full px-1.5",
           )}
         >
-          {selectedMentions.map((mention) => (
-            <span
-              key={mentionChipKey(mention)}
-              data-testid="mention-chip"
-              data-mention-kind={mention.kind}
-              className="inline-flex max-w-full items-center gap-1.5 rounded-full bg-accent px-2.5 py-1 text-[13px] text-foreground"
-            >
-              <MentionChipIcon mention={mention} />
-              <span dir="auto" className="truncate">
-                {mention.name}
-              </span>
-              <button
-                type="button"
-                aria-label={t`Remove mention ${mention.name}`}
-                onClick={() =>
-                  setSelectedMentions((current) =>
-                    current.filter(
-                      (selected) => mentionChipKey(selected) !== mentionChipKey(mention),
-                    ),
-                  )
-                }
-                className="text-muted-foreground hover:text-foreground"
-              >
-                <X size={12} strokeWidth={2} />
-              </button>
-            </span>
-          ))}
           <textarea
             ref={textareaRef}
             value={draft}
             onChange={(event) => updateDraft(event.target.value)}
             onPaste={handlePaste}
             onKeyDown={(event) => {
-              if (event.key === "Backspace" && draft.length === 0 && selectedMentions.length > 0) {
-                event.preventDefault();
-                removeLastChip();
-                return;
-              }
-              const action = resolveMentionPickerKey({
-                key: event.key,
-                shiftKey: event.shiftKey,
-                isComposing: event.nativeEvent.isComposing || event.keyCode === 229,
-                optionCount: mentionOptions.length,
-                highlightedIndex: activeMentionIndex,
-              });
-              if (action.type === "complete") {
-                const mention = mentionOptions[action.index];
-                if (!mention) return;
-                event.preventDefault();
-                insertMention(mention);
-                return;
-              }
-              if (action.type === "move") {
-                event.preventDefault();
-                setMentionHighlightIndex(action.index);
-                return;
-              }
-              if (action.type === "dismiss") {
-                event.preventDefault();
-                setMentionQuery(null);
-                setMentionHighlightIndex(0);
-                return;
-              }
-              if (action.type === "send") {
+              const composing = event.nativeEvent.isComposing || event.keyCode === 229;
+              if (event.key === "Enter" && !event.shiftKey && !composing) {
                 event.preventDefault();
                 send();
               }
             }}
             placeholder={
               showComposerPlaceholder
-                ? (placeholder ??
-                  (activeName
-                    ? museMode
-                      ? t`What can I help you with?`
-                      : t`Message ${activeName}`
-                    : t`Message…`))
+                ? (placeholder ?? (activeName ? t`What can I help you with?` : t`Message…`))
                 : undefined
             }
-            aria-label={
-              museMode ? t`Message superchat` : activeName ? t`Message ${activeName}` : t`Message`
-            }
-            role="combobox"
-            aria-autocomplete="list"
-            aria-haspopup="listbox"
-            aria-expanded={mentionPickerOpen}
-            aria-controls={mentionPickerOpen ? mentionListboxId : undefined}
-            aria-activedescendant={activeMentionOptionId}
+            aria-label={t`Message superchat`}
             name="chat-message"
             autoComplete="off"
             dir="auto"
             rows={1}
             className={cn(
               "min-h-[24px] min-w-[8rem] flex-1 resize-none overflow-y-auto bg-transparent py-0.5 leading-6 text-foreground outline-none placeholder:text-muted-foreground disabled:opacity-40",
-              museMode
-                ? "max-h-[200px] min-h-[44px] text-[15px] placeholder:text-ink-3"
-                : "max-h-32 text-[15.5px]",
+              "max-h-[200px] min-h-[44px] text-[15px] placeholder:text-ink-3",
             )}
           />
         </div>
         {running ? (
-          <div className={cn("flex shrink-0 items-center gap-1.5", museMode && "ms-auto")}>
+          <div className={"ms-auto flex shrink-0 items-center gap-1.5"}>
             <Button
               size="icon"
               aria-label={t`Send`}
@@ -809,9 +626,7 @@ export const Composer = memo(function Composer({
               onClick={send}
               className={cn(
                 "size-8 rounded-full shadow-sm transition-transform active:scale-95",
-                museMode
-                  ? "size-[34px] bg-tint text-white shadow-none hover:bg-tint hover:brightness-110"
-                  : "bg-white text-black hover:bg-white/90",
+                "size-[34px] bg-tint text-white shadow-none hover:bg-tint hover:brightness-110",
               )}
             >
               <ArrowUp size={16} strokeWidth={2.2} />
@@ -835,10 +650,7 @@ export const Composer = memo(function Composer({
             onClick={send}
             className={cn(
               "size-8 shrink-0 rounded-full shadow-sm transition-transform active:scale-95",
-              museMode && "ms-auto",
-              museMode
-                ? "size-[34px] bg-tint text-white shadow-none hover:bg-tint hover:brightness-110 disabled:bg-selection disabled:text-ink-3 disabled:opacity-100"
-                : "bg-white text-black hover:bg-white/90 disabled:bg-white/10 disabled:text-muted-foreground/30 disabled:shadow-none",
+              "ms-auto size-[34px] bg-tint text-white shadow-none hover:bg-tint hover:brightness-110 disabled:bg-selection disabled:text-ink-3 disabled:opacity-100",
             )}
           >
             <ArrowUp size={16} strokeWidth={2.2} />

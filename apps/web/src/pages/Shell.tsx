@@ -1,6 +1,5 @@
 import { useLingui } from "@lingui/react/macro";
 import type { Bot, ChatSummary, ThreadMessage } from "@superchat/contracts";
-import { userVisibleMessages } from "@superchat/core";
 import { AvatarStyleProvider } from "@superchat/ui-web";
 import type { ReactNode } from "react";
 import {
@@ -64,7 +63,6 @@ import {
 } from "./muse/chrome/EmptyConversation";
 import { Home } from "./muse/chrome/Home";
 import { HomeActivity } from "./muse/chrome/HomeActivity";
-import { museMode } from "./muse/chrome/museMode";
 import { BotSettingsPanel } from "./muse/chrome/PanelForms";
 import type { Panel } from "./muse/chrome/panel";
 import { SidePanelHeader } from "./muse/chrome/SidePanelHeader";
@@ -317,11 +315,9 @@ export function ShellPage() {
   const forkOverlayOpen = Boolean(forks.thread || forks.ask);
   const transcriptMessages = useMemo(
     () =>
-      userVisibleMessages(
-        museTranscript.pendingMessage
-          ? [...(museTranscript.messages ?? []), museTranscript.pendingMessage]
-          : (museTranscript.messages ?? []),
-      ),
+      museTranscript.pendingMessage
+        ? [...(museTranscript.messages ?? []), museTranscript.pendingMessage]
+        : (museTranscript.messages ?? []),
     [museTranscript.messages, museTranscript.pendingMessage],
   );
   // An empty Conversation is a start page: the greeting, the composer centered under it, and
@@ -329,7 +325,6 @@ export function ShellPage() {
   const startPage =
     !forksView &&
     conversationLayout({
-      museMode,
       hasMuse: Boolean(active),
       loaded: museTranscript.messages !== null,
       messageCount: transcriptMessages.length,
@@ -444,7 +439,6 @@ export function ShellPage() {
   const composerEl = (
     <Composer
       key={`bot:${active?.id}`}
-      museMode={museMode}
       activeName={active?.name}
       running={running}
       pendingAttachments={activePendingAttachments}
@@ -619,7 +613,6 @@ export function ShellPage() {
                 ) : active ? (
                   <Transcript
                     key={museTranscript.threadId ?? active.id}
-                    museMode={museMode}
                     botDisplayName={active.name}
                     followSignal={followSignal}
                     museFace={{ color: active.color, identity: active.id }}
