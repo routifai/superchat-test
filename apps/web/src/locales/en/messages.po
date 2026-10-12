@@ -13,6 +13,11 @@ msgstr ""
 "Language-Team: \n"
 "Plural-Forms: \n"
 
+#. placeholder {0}: applied.length
+#. placeholder {0}: status.changes
+msgid "{0, plural, one {# change} other {# changes}}"
+msgstr "{0, plural, one {# change} other {# changes}}"
+
 #. placeholder {0}: messages.length
 msgid "{0, plural, one {# failed attempt} other {# failed attempts}}"
 msgstr "{0, plural, one {# failed attempt} other {# failed attempts}}"
@@ -132,6 +137,9 @@ msgstr "••••{hint} · Needs attention"
 msgid "1 cell"
 msgstr "1 cell"
 
+msgid "A file below changes"
+msgstr "A file below changes"
+
 msgid "About you"
 msgstr "About you"
 
@@ -140,6 +148,9 @@ msgstr "Account"
 
 msgid "Activity"
 msgstr "Activity"
+
+msgid "Add a file"
+msgstr "Add a file"
 
 msgid "Add a key in Settings to choose a model."
 msgstr "Add a key in Settings to choose a model."
@@ -177,6 +188,9 @@ msgstr "After a month"
 msgid "After a week"
 msgstr "After a week"
 
+msgid "After every update"
+msgstr "After every update"
+
 msgid "Align center"
 msgstr "Align center"
 
@@ -203,6 +217,9 @@ msgstr "Always allow this tool"
 
 msgid "Always allowed"
 msgstr "Always allowed"
+
+msgid "And every"
+msgstr "And every"
 
 msgid "Answer"
 msgstr "Answer"
@@ -405,6 +422,9 @@ msgstr "Chat with the workspace"
 msgid "Chats"
 msgstr "Chats"
 
+msgid "Checked · nothing new"
+msgstr "Checked · nothing new"
+
 msgid "Checking…"
 msgstr "Checking…"
 
@@ -517,6 +537,9 @@ msgstr "Could not load Memory"
 
 msgid "Could not load models."
 msgstr "Could not load models."
+
+msgid "Could not load the runs."
+msgstr "Could not load the runs."
 
 msgid "Could not load this file."
 msgstr "Could not load this file."
@@ -657,6 +680,9 @@ msgstr "Dashboard"
 msgid "Dashboard unavailable"
 msgstr "Dashboard unavailable"
 
+msgid "Day"
+msgstr "Day"
+
 msgid "Day of the month"
 msgstr "Day of the month"
 
@@ -759,6 +785,9 @@ msgstr "Download {title}"
 msgid "Duplicate"
 msgstr "Duplicate"
 
+msgid "e.g. only the prices; leave the title as it is"
+msgstr "e.g. only the prices; leave the title as it is"
+
 msgid "Earlier"
 msgstr "Earlier"
 
@@ -826,6 +855,11 @@ msgstr "failed"
 msgid "Failed"
 msgstr "Failed"
 
+#. placeholder {0}: newestReason ?? plainCode(run.errorCode) ?? t`it did not finish`
+#. placeholder {0}: status.reason
+msgid "Failed · {0}"
+msgstr "Failed · {0}"
+
 msgid "Failed to send message"
 msgstr "Failed to send message"
 
@@ -842,8 +876,14 @@ msgstr "Failed."
 msgid "File"
 msgstr "File"
 
+msgid "File in your Computer"
+msgstr "File in your Computer"
+
 msgid "Files"
 msgstr "Files"
+
+msgid "Files it reads"
+msgstr "Files it reads"
 
 msgid "Fill"
 msgstr "Fill"
@@ -957,6 +997,12 @@ msgstr "Hide sheets"
 msgid "Hide slides"
 msgstr "Hide slides"
 
+msgid "Hide the runs"
+msgstr "Hide the runs"
+
+msgid "How often"
+msgstr "How often"
+
 msgid "How superchat works with you"
 msgstr "How superchat works with you"
 
@@ -1002,8 +1048,14 @@ msgstr "Isolated preview"
 msgid "Isolated preview — no access to your account"
 msgstr "Isolated preview — no access to your account"
 
+msgid "it did not finish"
+msgstr "it did not finish"
+
 msgid "It gets its own web address. It runs on its own, separate from superchat, and can't see your conversations or files."
 msgstr "It gets its own web address. It runs on its own, separate from superchat, and can't see your conversations or files."
+
+msgid "It includes edits of yours that are not published."
+msgstr "It includes edits of yours that are not published."
 
 msgid "It starts fresh, with only what superchat knows about you."
 msgstr "It starts fresh, with only what superchat knows about you."
@@ -1026,11 +1078,21 @@ msgstr "just now"
 msgid "Just you, signed in"
 msgstr "Just you, signed in"
 
+msgid "Keep updated"
+msgstr "Keep updated"
+
+msgid "Keeps {title} updated"
+msgstr "Keeps {title} updated"
+
 msgid "Kind"
 msgstr "Kind"
 
 msgid "Knows our conversation"
 msgstr "Knows our conversation"
+
+#. placeholder {0}: whenText(live.checkedAt)
+msgid "Last checked {0} · nothing new"
+msgstr "Last checked {0} · nothing new"
 
 msgid "Layers"
 msgstr "Layers"
@@ -1065,6 +1127,21 @@ msgstr "Link address"
 
 msgid "List"
 msgstr "List"
+
+msgid "Live"
+msgstr "Live"
+
+msgid "Live · paused"
+msgstr "Live · paused"
+
+msgid "Live · update failed"
+msgstr "Live · update failed"
+
+msgid "Live page"
+msgstr "Live page"
+
+msgid "Live sheet"
+msgstr "Live sheet"
 
 msgid "Load earlier"
 msgstr "Load earlier"
@@ -1117,6 +1194,9 @@ msgstr "Model for this chat"
 
 msgid "Models"
 msgstr "Models"
+
+msgid "Month"
+msgstr "Month"
 
 msgid "Monthly"
 msgstr "Monthly"
@@ -1209,6 +1289,9 @@ msgstr "No matches"
 
 msgid "No matches."
 msgstr "No matches."
+
+msgid "No runs yet."
+msgstr "No runs yet."
 
 msgid "No sign-in needed"
 msgstr "No sign-in needed"
@@ -1315,6 +1398,9 @@ msgstr "Open loops"
 msgid "Open questions"
 msgstr "Open questions"
 
+msgid "Open run"
+msgstr "Open run"
+
 msgid "Open what's waiting on you"
 msgstr "Open what's waiting on you"
 
@@ -1354,6 +1440,13 @@ msgstr "Paragraph"
 
 msgid "Password"
 msgstr "Password"
+
+msgid "Paused"
+msgstr "Paused"
+
+#. placeholder {0}: status.failures
+msgid "Paused after {0} failed runs"
+msgstr "Paused after {0} failed runs"
 
 msgid "PDF"
 msgstr "PDF"
@@ -1440,11 +1533,20 @@ msgstr "Publish {name}?"
 msgid "Publish settings"
 msgstr "Publish settings"
 
+msgid "Publish this version"
+msgstr "Publish this version"
+
 msgid "Publish…"
 msgstr "Publish…"
 
 msgid "Published"
 msgstr "Published"
+
+msgid "Published copy follows updates"
+msgstr "Published copy follows updates"
+
+msgid "Published copy not updated."
+msgstr "Published copy not updated."
 
 msgid "Pull request"
 msgstr "Pull request"
@@ -1500,6 +1602,9 @@ msgstr "Remove"
 #. placeholder {0}: chip.label
 msgid "Remove {0}"
 msgstr "Remove {0}"
+
+msgid "Remove file"
+msgstr "Remove file"
 
 #. placeholder {0}: folder || t`Whole workspace`
 msgid "Remove folder {0}"
@@ -1561,6 +1666,9 @@ msgstr "restored"
 msgid "Restyles every slide; your content stays as it is."
 msgstr "Restyles every slide; your content stays as it is."
 
+msgid "Resume"
+msgstr "Resume"
+
 msgid "Retry"
 msgstr "Retry"
 
@@ -1584,6 +1692,9 @@ msgstr "running"
 
 msgid "Running"
 msgstr "Running"
+
+msgid "Running…"
+msgstr "Running…"
 
 msgid "Save"
 msgstr "Save"
@@ -1686,6 +1797,9 @@ msgstr "Show all ({count} characters)"
 msgid "Show as fork"
 msgstr "Show as fork"
 
+msgid "Show changes"
+msgstr "Show changes"
+
 msgid "Show earlier messages"
 msgstr "Show earlier messages"
 
@@ -1710,6 +1824,9 @@ msgstr "Show sheets"
 msgid "Show slides"
 msgstr "Show slides"
 
+msgid "Show the runs"
+msgstr "Show the runs"
+
 #. placeholder {0}: sheet.rows.length
 msgid "Showing the first {0} rows"
 msgstr "Showing the first {0} rows"
@@ -1722,6 +1839,9 @@ msgstr "Sign-in for {host}"
 
 msgid "Size"
 msgstr "Size"
+
+msgid "Skipped"
+msgstr "Skipped"
 
 #. placeholder {0}: skipped.join(", ")
 msgid "Skipped {0}"
@@ -1736,6 +1856,12 @@ msgstr "Slide rail"
 msgid "Slides"
 msgstr "Slides"
 
+msgid "Some changes could not be placed."
+msgstr "Some changes could not be placed."
+
+msgid "Some parts you changed differ from the source."
+msgstr "Some parts you changed differ from the source."
+
 msgid "Something went wrong before it could start."
 msgstr "Something went wrong before it could start."
 
@@ -1747,6 +1873,11 @@ msgstr "Something went wrong."
 
 msgid "Source"
 msgstr "Source"
+
+#. placeholder {0}: suggestion.sourceValue
+#. placeholder {1}: suggestion.yours
+msgid "Source says {0}, you wrote {1}"
+msgstr "Source says {0}, you wrote {1}"
 
 #. placeholder {0}: source.file
 msgid "Source: {0}"
@@ -1775,6 +1906,9 @@ msgstr "Spacing"
 msgid "Spent this month"
 msgstr "Spent this month"
 
+msgid "Start fresh"
+msgstr "Start fresh"
+
 #. placeholder {0}: botDisplayName ?? "superchat"
 msgid "Start it, and {0} works on it in the background."
 msgstr "Start it, and {0} works on it in the background."
@@ -1791,6 +1925,9 @@ msgstr "Starting the Computer…"
 msgid "Starting your Computer…"
 msgstr "Starting your Computer…"
 
+msgid "Starts fresh at the next update"
+msgstr "Starts fresh at the next update"
+
 msgid "Status"
 msgstr "Status"
 
@@ -1802,6 +1939,9 @@ msgstr "Still working on this."
 
 msgid "Stop"
 msgstr "Stop"
+
+msgid "Stop updating"
+msgstr "Stop updating"
 
 #. js-lingui-explicit-id
 msgid "Stopped."
@@ -1849,6 +1989,9 @@ msgstr "System"
 
 msgid "Table"
 msgstr "Table"
+
+msgid "Tell me in chat"
+msgstr "Tell me in chat"
 
 msgid "Text"
 msgstr "Text"
@@ -1920,6 +2063,9 @@ msgstr "This part of the page has no stable name in the file, so it can't be cha
 msgid "This week"
 msgstr "This week"
 
+msgid "Time"
+msgstr "Time"
+
 msgid "To do"
 msgstr "To do"
 
@@ -1944,6 +2090,9 @@ msgstr "Undo"
 msgid "Undo (⌘Z)"
 msgstr "Undo (⌘Z)"
 
+msgid "Undo this update"
+msgstr "Undo this update"
+
 msgid "Unpublish"
 msgstr "Unpublish"
 
@@ -1957,6 +2106,18 @@ msgstr "Unread"
 msgid "Unsupported file type: {0}"
 msgstr "Unsupported file type: {0}"
 
+msgid "Update now"
+msgstr "Update now"
+
+msgid "Update when"
+msgstr "Update when"
+
+msgid "updated"
+msgstr "updated"
+
+msgid "Updated"
+msgstr "Updated"
+
 #. placeholder {0}: superseded.version
 msgid "Updated — v{0}"
 msgstr "Updated — v{0}"
@@ -1965,6 +2126,11 @@ msgstr "Updated — v{0}"
 msgid "Updated · version {0}"
 msgstr "Updated · version {0}"
 
+#. placeholder {0}: whenText(update.at)
+#. placeholder {0}: whenText(updatedAt)
+msgid "Updated {0}"
+msgstr "Updated {0}"
+
 #. placeholder {0}: content.arrived.version
 msgid "Updated by superchat · v{0}"
 msgstr "Updated by superchat · v{0}"
@@ -1972,6 +2138,21 @@ msgstr "Updated by superchat · v{0}"
 #. placeholder {0}: content.arrived.version
 msgid "Updated by you · v{0}"
 msgstr "Updated by you · v{0}"
+
+msgid "Updates daily"
+msgstr "Updates daily"
+
+msgid "Updates monthly"
+msgstr "Updates monthly"
+
+msgid "Updates on a schedule"
+msgstr "Updates on a schedule"
+
+msgid "Updates weekly"
+msgstr "Updates weekly"
+
+msgid "Updates when file changes"
+msgstr "Updates when file changes"
 
 msgid "Upload"
 msgstr "Upload"
@@ -1991,6 +2172,9 @@ msgstr "Uploading {0}…"
 msgid "Uploading…"
 msgstr "Uploading…"
 
+msgid "Use source value"
+msgstr "Use source value"
+
 msgid "Use this look"
 msgstr "Use this look"
 
@@ -2004,6 +2188,7 @@ msgid "Vault"
 msgstr "Vault"
 
 #. placeholder {0}: entry.version
+#. placeholder {0}: version.version
 msgid "Version {0}"
 msgstr "Version {0}"
 
@@ -2033,6 +2218,12 @@ msgstr "Wait for superchat to finish, then clear."
 msgid "Waiting on you"
 msgstr "Waiting on you"
 
+msgid "Waiting to start"
+msgstr "Waiting to start"
+
+msgid "Week"
+msgstr "Week"
+
 msgid "Weekly"
 msgstr "Weekly"
 
@@ -2060,11 +2251,20 @@ msgstr "What I do on my own, in the background."
 msgid "What should superchat do?"
 msgstr "What should superchat do?"
 
+msgid "What to update"
+msgstr "What to update"
+
 msgid "What we talked about"
 msgstr "What we talked about"
 
+msgid "When {files} changes"
+msgstr "When {files} changes"
+
 msgid "When I need a decision or an answer, it'll show up here."
 msgstr "When I need a decision or an answer, it'll show up here."
+
+msgid "When something important changes"
+msgstr "When something important changes"
 
 msgid "Who can open it"
 msgstr "Who can open it"

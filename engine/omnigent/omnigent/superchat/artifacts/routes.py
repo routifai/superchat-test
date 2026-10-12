@@ -20,9 +20,15 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.stores import ConversationStore, PermissionStore
-from omnigent.superchat.artifact_kinds import KIND_MIME, MAX_ARTIFACT_BYTES, kind_for_name
+from omnigent.superchat.artifact_kinds import (
+    KIND_MIME,
+    MAX_ARTIFACT_BYTES,
+    is_deck_name,
+    kind_for_name,
+)
+from omnigent.superchat.artifacts.patches import name_elements
 from omnigent.superchat.artifacts.store import (
-    HAND_ORIGINS,
+    WRITEBACK_ORIGINS,
     Artifact,
     Publication,
     SqlAlchemyArtifactStore,
@@ -124,9 +130,14 @@ def _refuse_unseen_manual_edit(
     """
     group = store.versions_of(user_id=owner, parent_session_id=session_id, name=name)
     head = group[0] if group else None
-    if head is not None and head.origin in HAND_ORIGINS and head.delivered_at is None:
+    if head is not None and head.origin in WRITEBACK_ORIGINS and head.delivered_at is None:
+        who = (
+            f"{name} was refreshed from its sources"
+            if head.origin == "update"
+            else f"The person edited {name} by hand"
+        )
         raise OmnigentError(
-            f"The person edited {name} by hand (v{head.version}); read the workspace file "
+            f"{who} (v{head.version}); read the workspace file "
             "again and apply your change on top of their edits before saving.",
             code=ErrorCode.CONFLICT,
         )
@@ -185,6 +196,9 @@ def create_artifacts_router(
         await asyncio.to_thread(
             _refuse_unseen_manual_edit, store, owner, parent_session_id, clean_name
         )
+        if kind == "html" and not is_deck_name(clean_name):
+            # A page is editable by hand only where it has ids; don't leave that to the author.
+            data = await asyncio.to_thread(name_elements, data)
         item = await asyncio.to_thread(
             store.create,
             user_id=owner,

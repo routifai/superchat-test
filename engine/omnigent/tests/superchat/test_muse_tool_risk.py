@@ -27,9 +27,12 @@ MUSE_LABELS = {"omnigent.context.mode": "superside-chat", "omnigent.superchat.mu
 # ``objective_*`` tools are classified by their arguments or prefix, not listed here.
 RISK: dict[str, str | None] = {
     "artifact_delete": "delete",
+    "artifact_keep_updated": None,
     "artifact_list": None,
+    "artifact_live_settings": None,
     "artifact_publish": "post",
     "artifact_save": None,
+    "artifact_stop_updating": None,
     "ask_clarification": None,
     "deck_check": None,
     "deck_export": None,

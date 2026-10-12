@@ -1867,6 +1867,38 @@ class SqlArtifactPublication(OmnigentBase):
     )
 
 
+class SqlArtifactLive(OmnigentBase):
+    """
+    SQLAlchemy model for the ``artifact_live`` table: one row per live page (an artifact group).
+
+    The schedule is the scheduled task ``task_id``; ``sources`` is a JSON list of web page URLs
+    or Computer file paths; ``state`` is what the updates remember (``superchat/live/store.py``).
+    """
+
+    __tablename__ = "artifact_live"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    parent_session_id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    name: Mapped[str] = mapped_column(String(512), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    sources: Mapped[str] = mapped_column(Text, nullable=False, server_default="[]")
+    tell: Mapped[str] = mapped_column(String(8), nullable=False, server_default="notable")
+    follow_publish: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
+
+    __table_args__ = (
+        Index("ix_artifact_live_task", "workspace_id", "task_id"),
+        Index("ix_artifact_live_owner", "workspace_id", "user_id"),
+    )
+
+
 class SqlArtifactView(OmnigentBase):
     """
     SQLAlchemy model for the ``artifact_views`` table.

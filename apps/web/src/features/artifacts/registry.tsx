@@ -1,4 +1,4 @@
-import type { Artifact } from "@superchat/contracts";
+import type { Artifact, ArtifactVersion } from "@superchat/contracts";
 import { createContext, Fragment, type ReactNode, useContext } from "react";
 import type { AskChip } from "./ask/AskBox";
 
@@ -22,6 +22,8 @@ export interface ArtifactPanelParts {
   holdsEscape?: boolean;
   /** `DropdownMenuItem`s for the header's `⋯` menu. */
   overflow?: ReactNode;
+  /** A quiet line at the bottom of the version menu ("Last checked Mon · nothing new"). */
+  versionNote?: ReactNode;
 }
 
 /** What `usePanel` is given about the file being shown. */
@@ -30,6 +32,8 @@ export interface ArtifactPanelArgs {
   title?: string;
   /** The shown version's bytes, once loaded. */
   bytes?: Uint8Array;
+  /** The page's newest version, when the list has loaded. */
+  newestVersion?: ArtifactVersion | null;
 }
 
 export interface ArtifactCardParts {
@@ -51,6 +55,11 @@ export interface ArtifactExtension {
   usePanel(args: ArtifactPanelArgs): ArtifactPanelParts;
   /** Plain function for a Library card. */
   card(artifact: Artifact): ArtifactCardParts | null;
+  /** Like `card`, for parts that follow data which loads or changes (called as a hook). */
+  useCard?(artifact: Artifact): ArtifactCardParts | null;
+  /** A Library filter chip of its own ("Live"), or null while it has nothing to show. `matches`
+   * says which files it keeps. Called as a hook. */
+  useLibraryFacet?(): LibraryFacet | null;
   /** A viewer for this file, or null to leave it to the default preview. */
   view?(props: ArtifactViewProps): ReactNode | null;
   /** A live preview for a chat file card's body (a chart), or null to leave it to the default.
@@ -64,7 +73,19 @@ export interface ArtifactExtension {
   /** The editor kind for this file (a deck, a page), or null: the file then opens in the same
    * editor shell read-only, with its `view` (or the default preview) on the stage. */
   editor?(artifact: Artifact): ArtifactEditorKind | null;
+  /** A field for the publish dialog. `register` hands the dialog a save to run when the person
+   * confirms; it returns the unregister. */
+  publishOptions?(artifact: Artifact, register: RegisterPublishSave): ReactNode;
 }
+
+export interface LibraryFacet {
+  /** Stable, never one of the file kinds ("live"). */
+  value: string;
+  label: string;
+  matches(artifact: Artifact): boolean;
+}
+
+export type RegisterPublishSave = (save: () => Promise<void>) => () => void;
 
 /**
  * One kind of file in the artifact editor (`editor/ArtifactEditor`). The shell owns the frame —
@@ -135,6 +156,8 @@ export interface ArtifactEditorHistory {
   redo: () => Promise<void>;
   /** Saves what is staged; before an ask, so superchat works on it. */
   flush: () => Promise<void>;
+  /** Ends a text edit still in progress and saves it with the rest (before leaving edit mode). */
+  finish?: () => Promise<void>;
   /** The next outside version is superchat's answer to an ask from here (Undo steps over it). */
   expectAsk: (on: boolean) => void;
   /** The newest version this editor saved (may not be on screen yet). */
@@ -173,7 +196,7 @@ export const useArtifactExtensions = () => useContext(ArtifactRegistryContext);
 /** Every extension's panel parts, merged in registry order. */
 export function useArtifactPanelParts(
   args: ArtifactPanelArgs,
-): Required<ArtifactPanelParts> & { hasOverflow: boolean } {
+): Required<ArtifactPanelParts> & { hasOverflow: boolean; hasVersionNote: boolean } {
   const extensions = useArtifactExtensions();
   // The registry never changes after Shell mounts it, so the hook order is stable.
   // biome-ignore lint/correctness/useHookAtTopLevel: a fixed list, called in the same order
@@ -188,7 +211,9 @@ export function useArtifactPanelParts(
     wide: parts.some((part) => part.wide),
     holdsEscape: parts.some((part) => part.holdsEscape),
     overflow: slot((part) => part.overflow),
+    versionNote: slot((part) => part.versionNote),
     hasOverflow: parts.some((part) => !!part.overflow),
+    hasVersionNote: parts.some((part) => !!part.versionNote),
   };
 }
 
@@ -203,9 +228,36 @@ export function useArtifactEditorKind(artifact: Artifact | undefined): ArtifactE
   return null;
 }
 
+/** The publish dialog's extra fields from every extension, given the dialog's `register`. */
+export function useArtifactPublishOptions(
+  artifact: Artifact | undefined,
+): (register: RegisterPublishSave) => ReactNode {
+  const extensions = useArtifactExtensions();
+  return (register) =>
+    artifact
+      ? extensions.map((extension, index) => (
+          <Fragment key={index}>{extension.publishOptions?.(artifact, register)}</Fragment>
+        ))
+      : null;
+}
+
 /** Every extension's card parts for one artifact. */
 export function useArtifactCardParts(artifact: Artifact): ArtifactCardParts[] {
-  return useArtifactExtensions()
-    .map((extension) => extension.card(artifact))
+  const extensions = useArtifactExtensions();
+  // The registry never changes after Shell mounts it, so the hook order is stable.
+  // biome-ignore lint/correctness/useHookAtTopLevel: a fixed list, called in the same order
+  const hooked = extensions.map((extension) => extension.useCard?.(artifact) ?? null);
+  return extensions
+    .map((extension, index) => extension.card(artifact) ?? hooked[index] ?? null)
     .filter((part): part is ArtifactCardParts => part !== null);
+}
+
+/** The Library filter chips the extensions add. */
+export function useArtifactLibraryFacets(): LibraryFacet[] {
+  return (
+    useArtifactExtensions()
+      // biome-ignore lint/correctness/useHookAtTopLevel: a fixed list, called in the same order
+      .map((extension) => extension.useLibraryFacet?.() ?? null)
+      .filter((facet): facet is LibraryFacet => facet !== null)
+  );
 }

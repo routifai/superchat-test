@@ -77,7 +77,6 @@ export function useHtmlEditor({
   const [reloadKey, setReloadKey] = useState(0);
   const [undoStack, setUndoStack] = useState<string[]>([]);
   const [redoStack, setRedoStack] = useState<string[]>([]);
-  const [askRequest, setAskRequest] = useState(0);
 
   const undoStackRef = useRef(undoStack);
   undoStackRef.current = undoStack;
@@ -202,6 +201,20 @@ export function useHtmlEditor({
   );
 
   const flush = useCallback(() => committer.commit(), [committer]);
+  // A text edit in the frame, and who waits for it to end (`finish`).
+  const textOpen = useRef(false);
+  const textEnded = useRef<(() => void) | null>(null);
+  /** Ends a text edit in progress (the frame sends its text first), then saves everything. */
+  const finish = useCallback(async () => {
+    if (textOpen.current) {
+      await new Promise<void>((resolve) => {
+        textEnded.current = resolve;
+        postRef.current({ type: "superchat:edit-text-finish", commit: true });
+        setTimeout(resolve, 1_000); // a frame that never answers
+      });
+    }
+    await committer.commit();
+  }, [committer]);
   const setExpectAsk = useCallback((on: boolean) => {
     expectAsk.current = on;
   }, []);
@@ -273,10 +286,11 @@ export function useHtmlEditor({
       undo,
       redo,
       flush,
+      finish,
       expectAsk: setExpectAsk,
       headVersion: () => saved.current.version,
     }),
-    [canUndo, canRedo, saving, undo, redo, flush, setExpectAsk],
+    [canUndo, canRedo, saving, undo, redo, flush, finish, setExpectAsk],
   );
 
   /** The bridge's messages (already validated and nonce-checked by the stage). */
@@ -292,12 +306,11 @@ export function useHtmlEditor({
           break;
         case "superchat:edit-text-session":
           setTextEditing(message.active);
+          textOpen.current = message.active;
+          if (!message.active) textEnded.current?.();
           break;
         case "superchat:edit-text-commit":
           void committer.commit([{ kind: "set-text", id: message.id, text: message.text }]);
-          break;
-        case "superchat:edit-ask":
-          setAskRequest((n) => n + 1);
           break;
         case "superchat:edit-key":
           if (message.action === "undo") void undo();
@@ -319,7 +332,6 @@ export function useHtmlEditor({
     textEditing,
     reloadKey,
     selectedIds,
-    askRequest,
     head: saved,
     history,
     applyStyle,
@@ -334,9 +346,9 @@ export function useHtmlEditor({
     onFrameMessage,
     finishText: () => postRef.current({ type: "superchat:edit-text-finish", commit: true }),
     /** Select these elements (a layer picked in the navigator); kept for a frame not yet up. */
-    select: (ids: string[]) => {
+    select: (ids: string[], scroll = false) => {
       selectedIds.current = ids;
-      postRef.current({ type: "superchat:edit-select", ids });
+      postRef.current({ type: "superchat:edit-select", ids, ...(scroll ? { scroll } : {}) });
     },
   };
 }

@@ -250,6 +250,26 @@ async def test_quiet_hours_defers_to_window_end() -> None:
     assert conv_store.created == []
 
 
+async def test_registered_kind_hook_defers_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(helper_fire._FIRE_DEFERRALS, "waits", lambda _task: time.time() + 600)
+    store = _Store({"task_1": _bound_task(kind="waits")})
+    conv_store = _ParentConversationStore(_Parent())
+    await _fire(store, conv_store, _ok_launch)
+    assert store.runs[0]["status"] == "skipped"
+    assert store.runs[0]["error_code"] == "task_deferred"
+    assert (0, "task_1") in fire_mod._REFIRES
+    assert conv_store.created == []
+
+
+async def test_registered_kind_hook_with_nothing_to_wait_for_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(helper_fire._FIRE_DEFERRALS, "waits", lambda _task: None)
+    store = _Store({"task_1": _bound_task(kind="waits")})
+    await _fire(store, _ParentConversationStore(_Parent()), _ok_launch)
+    assert store.runs[0]["status"] == "running"
+
+
 def test_quiet_window_end_crossing_midnight() -> None:
     prefs = OwnerPreferences(
         "u", quiet_start="22:00", quiet_end="07:00", timezone="America/Toronto"
@@ -288,6 +308,101 @@ async def test_owner_busy_defers_then_skips() -> None:
     )
     assert store.runs[-1]["error_code"] == "owner_busy"
     assert not fire_mod._REFIRES
+
+
+def _running(*task_ids: str) -> list[ScheduledTaskRun]:
+    now = int(time.time())
+    return [
+        ScheduledTaskRun(f"r{i}", t, "running", now, fired_at=now) for i, t in enumerate(task_ids)
+    ]
+
+
+async def test_busy_never_drops_a_live_page_run() -> None:
+    store = _Store({"task_1": _bound_task(kind="live_artifact")})
+    store.running = _running(*(f"t{i}" for i in range(3)))
+    store._rows.update({f"t{i}": _bound_task(id=f"t{i}") for i in range(3)})
+    conv_store = _ParentConversationStore(_Parent())
+    deps = _deps(store, conversation_store=conv_store)
+    await fire_mod._run_parent_bound_fire(
+        deps,
+        _bound_task(kind="live_artifact"),
+        fire_mod._build_fire_dispatch(deps, _ok_launch),
+        int(time.time()),
+        attempt=1,
+        deferrals=fire_mod._MAX_OWNER_BUSY_DEFERRALS + 5,
+    )
+    assert store.runs[-1]["error_code"] == "owner_busy_deferred"
+    assert (0, "task_1") in fire_mod._REFIRES and conv_store.created == []
+
+
+async def test_cap_lets_live_runs_overlap_up_to_the_limit() -> None:
+    rows = {f"t{i}": _bound_task(id=f"t{i}") for i in range(3)}
+    store = _Store({"task_1": _bound_task(kind="live_artifact"), **rows})
+    conv_store = _ParentConversationStore(_Parent())
+    store.running = _running("t0", "t1")
+    await _fire(store, conv_store, _ok_launch)
+    assert len(conv_store.created) == 1  # two running, the cap is three: room for this one
+    store.running = _running("t0", "t1", "t2")
+    await _fire(store, conv_store, _ok_launch)
+    assert len(conv_store.created) == 1 and store.runs[-1]["error_code"] == "owner_busy_deferred"
+
+
+async def test_one_live_run_at_a_time_while_the_conversation_has_a_turn_running() -> None:
+    rows = {"t0": _bound_task(id="t0")}
+    store = _Store({"task_1": _bound_task(kind="live_artifact"), **rows})
+    parent = _Parent()
+    parent.live_status = "running"  # type: ignore[attr-defined]
+    conv_store = _ParentConversationStore(parent)
+    store.running = _running("t0")
+    await _fire(store, conv_store, _ok_launch)
+    assert store.runs[-1]["error_code"] == "owner_busy_deferred" and conv_store.created == []
+    fire_mod._REFIRES.pop((0, "task_1")).cancel()
+    store.running = []
+    await _fire(store, conv_store, _ok_launch)
+    assert len(conv_store.created) == 1
+
+
+async def test_the_cap_follows_the_room_the_computer_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.scheduled import helper_fire
+
+    rows = {f"t{i}": _bound_task(id=f"t{i}") for i in range(4)}
+    store = _Store({"task_1": _bound_task(kind="live_artifact"), **rows})
+    conv_store = _ParentConversationStore(_Parent())
+    room = {"now": 1}
+    monkeypatch.setattr(helper_fire, "_ROOM", [lambda task: room["now"]])
+    store.running = _running("t0")
+    await _fire(store, conv_store, _ok_launch)  # a loaded Computer: one at a time
+    assert store.runs[-1]["error_code"] == "owner_busy_deferred" and conv_store.created == []
+    fire_mod._REFIRES.pop((0, "task_1")).cancel()
+    room["now"] = 5
+    store.running = _running("t0", "t1", "t2", "t3")
+    await _fire(store, conv_store, _ok_launch)  # an idle one: four running, room for a fifth
+    assert len(conv_store.created) == 1
+    # A cap the operator set wins over what the Computer reports; no report is the default.
+    monkeypatch.setenv("OMNIGENT_AUTOMATION_MAX_CONCURRENT", "2")
+    assert fire_mod._max_concurrent(5) == 2
+    monkeypatch.delenv("OMNIGENT_AUTOMATION_MAX_CONCURRENT")
+    assert (fire_mod._max_concurrent(None), fire_mod._max_concurrent(0)) == (3, 1)
+
+
+def test_run_outcome_hook_note_is_posted_once_in_the_conversation() -> None:
+    conv_store = _ParentConversationStore(_Parent())
+    seen: list[Any] = []
+
+    def hook(task: Any, failure: str | None) -> str | None:
+        seen.append(failure)
+        return "paused" if failure else None
+
+    helper_fire.register_run_outcome("live_artifact", hook)
+    try:
+        task = _bound_task(kind="live_artifact")
+        assert not helper_fire.report_run_outcome(conv_store, task, None)
+        assert helper_fire.report_run_outcome(conv_store, task, "boom")
+    finally:
+        helper_fire._RUN_OUTCOMES.pop("live_artifact")
+    assert seen == [None, "boom"] and len(conv_store.appended["conv_parent"]) == 1
 
 
 async def test_failed_launch_schedules_one_retry() -> None:

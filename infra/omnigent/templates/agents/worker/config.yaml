@@ -45,6 +45,8 @@ tools:
     - vault_fill
     - artifact_save
     - artifact_list
+    - live_update_context
+    - live_update_save
     - files_search
     - files_vsearch
     - files_query
