@@ -13,6 +13,7 @@ import base64
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import itertools
 import json
 import logging
@@ -32,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overl
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
+    from omnigent.entities import CompactionData
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
@@ -1356,13 +1358,6 @@ _GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
 # (rollover/README.md); the post-compaction verbatim-tail block is only ever
 # prepended for them.
 _POST_COMPACTION_TAIL_HARNESSES = frozenset({"claude-native", "codex-native"})
-
-# Bound on a turn's wait for a same-session superside-chat rollover already
-# in flight (see _consume_superside_chat_pending_refresh). Only applies at the
-# hard context limit (omnigent.superchat.rollover.HARD_CONTEXT_WINDOW_FRACTION):
-# below it the turn dispatches immediately and never waits on the summarizer.
-# The rollover itself is not cancelled on timeout — only this wait gives up.
-_SUPERSIDE_CHAT_ROLLOVER_WAIT_TIMEOUT_S = 60.0
 
 
 def _prefix_blocks_with_tail(blocks: object, prefix: str) -> object:
@@ -3518,6 +3513,11 @@ def create_runner_app(
     _superside_chat_rollover_tasks: dict[str, asyncio.Task[None]] = {}
     # conv_id -> context fill the session's latest turn reported (hard-limit check).
     _superside_chat_last_context_tokens: dict[str, int] = {}
+    # conv_id -> what the session's current warm client was last sent of the Memory Profile and
+    # Projects blocks (hashes, plus the prompt and subprocess it was sent under); and what the
+    # turn in flight carries, kept once the turn completes (see _apply_turn_prefix_blocks).
+    _superside_chat_prefix_sent: dict[str, dict[str, str]] = {}
+    _superside_chat_prefix_pending: dict[str, dict[str, str]] = {}
     app.state.superside_chat_pending_refresh = _superside_chat_pending_refresh
     app.state.superside_chat_rollover_tasks = _superside_chat_rollover_tasks
     _last_server_item_id: dict[str, str] = {}
@@ -5531,6 +5531,7 @@ def create_runner_app(
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
+        _forget_superside_chat_prefix(session_id)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
@@ -5604,53 +5605,55 @@ def create_runner_app(
     async def _load_history_as_input(
         session_id: str,
         drop_item_id: str | None = None,
+        keep_tokens: int | None = None,
+        tail_tokens_out: list[int] | None = None,
     ) -> list[_JsonObject]:
+        """Rebuild a session's harness input from its record.
+
+        Reads from the latest checkpoint's anchor on, not from item 1 (see
+        ``iter_items_from_checkpoint``); the record before it stays reachable
+        through ``session_history``. With *keep_tokens*, only the newest whole
+        turns after the checkpoint that fit it are kept (the hard-limit trim).
+        *tail_tokens_out* receives the token count of the items after the
+        checkpoint, counted as the kept tail is (the idle-return size check).
+        """
+        from omnigent.context.labels import is_superside_chat
+        from omnigent.superchat.rollover import (
+            ItemsPageFetchError,
+            iter_items_from_checkpoint,
+        )
+
         all_items: list[_JsonObject] = []
-        after_cursor: str | None = None
-        while True:
-            params: dict[str, str] = {
-                "limit": "100",
-                "order": "asc",
-            }
-            if after_cursor is not None:
-                params["after"] = after_cursor
-            try:
-                resp = await server_client.get(
-                    f"/v1/sessions/{session_id}/items",
-                    params=params,
-                    timeout=10.0,
-                )
-                if resp.status_code != 200:
-                    _logger.warning(
-                        "History load returned %d for session=%s",
-                        resp.status_code,
-                        session_id,
-                        extra={"session_id": session_id},
-                    )
-                    break
-            except httpx.HTTPError:
-                _logger.warning(
-                    "History load failed for session=%s",
-                    session_id,
-                    exc_info=True,
-                    extra={"session_id": session_id},
-                )
-                break
-            page = resp.json()
-            page_items = page.get("data", [])
-            if not page_items:
-                break
-            all_items.extend(page_items)
-            last_id = page_items[-1].get("id")
-            if last_id:
-                _last_server_item_id[session_id] = last_id
-            if not page.get("has_more", False):
-                break
-            after_cursor = last_id
+        try:
+            async for page_items in iter_items_from_checkpoint(
+                server_client,
+                session_id,
+                skip_placeholders=is_superside_chat(
+                    await _rollover_labels_for_session(session_id)
+                ),
+            ):
+                all_items.extend(page_items)
+                last_id = page_items[-1].get("id")
+                if last_id:
+                    _last_server_item_id[session_id] = last_id
+        except (httpx.HTTPError, ValueError, ItemsPageFetchError):
+            _logger.warning(
+                "History load failed for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
 
         if drop_item_id is not None:
             all_items = [it for it in all_items if it.get("id") != drop_item_id]
-        converted = _convert_raw_items_to_input(all_items)
+        if tail_tokens_out is not None:
+            from omnigent.context.rollover import count_tokens, split_at_latest_compaction
+            from omnigent.models.model_fallbacks import ROLLOVER_TOKEN_COUNT_MODEL
+
+            tail_tokens_out.append(
+                count_tokens(split_at_latest_compaction(all_items)[0], ROLLOVER_TOKEN_COUNT_MODEL)
+            )
+        converted = _convert_raw_items_to_input(all_items, keep_tokens=keep_tokens)
         # Items are persisted pre-resolution, so reloaded history can still
         # carry raw file_id blocks (the runner has no file/artifact stores).
         # Resolve them the same way current-turn intake does.
@@ -5666,12 +5669,20 @@ def create_runner_app(
 
     def _convert_raw_items_to_input(
         items: list[_JsonObject],
+        keep_tokens: int | None = None,
     ) -> list[_JsonObject]:
-        from omnigent.context.rollover import split_at_latest_compaction
+        from omnigent.context.rollover import select_recent, split_at_latest_compaction
+        from omnigent.models.model_fallbacks import ROLLOVER_TOKEN_COUNT_MODEL
 
         # Items after the checkpoint's anchor, including any turn that ran
         # while the rollover was summarizing (see split_at_latest_compaction).
         remaining, c = split_at_latest_compaction(items)
+        if keep_tokens is not None:
+            # Whole newest turns that fit; the latest user message is always in.
+            remaining = (
+                select_recent(remaining, keep_tokens=keep_tokens, model=ROLLOVER_TOKEN_COUNT_MODEL)
+                or remaining
+            )
         compaction_idx = None if c is None else items.index(c)
 
         result: list[_JsonObject] = []
@@ -7930,6 +7941,95 @@ def create_runner_app(
             and part.get("text") == "/compact"
         )
 
+    def _journal_checkpoint(
+        conv_id: str, labels: Mapping[str, str] | None
+    ) -> Callable[[CompactionData], Awaitable[None]]:
+        """The ``on_stored`` hook for ``roll_over_session``: copy the checkpoint to ``memory/``."""
+        from omnigent.runner.memory.sync import record_checkpoint
+
+        async def _record(item: CompactionData) -> None:
+            await record_checkpoint(server_client, conv_id, dict(labels or {}), item)
+
+        return _record
+
+    _memory_rebuilds: set[str] = set()
+
+    def _schedule_memory_sync(conv_id: str, labels: Mapping[str, str] | None) -> None:
+        """Heal ``memory/`` in the background: missing folder, new owner, a reset not yet seen."""
+        from omnigent.runner.memory.sync import reconcile
+
+        if _memory_rebuilds:
+            return
+        _memory_rebuilds.add(conv_id)
+
+        async def _run() -> None:
+            try:
+                await reconcile(server_client, conv_id, dict(labels or {}))
+            finally:
+                _memory_rebuilds.discard(conv_id)
+
+        task = asyncio.create_task(_run(), name=f"memory-sync-{conv_id}")
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    async def _handle_superside_chat_compact(conv_id: str) -> Response:
+        """Compact a superside-chat session with Omnigent's own rollover.
+
+        The Claude SDK's ``/compact`` stores a placeholder summary, not a
+        checkpoint (and auto-compaction is off in this mode). The same
+        :func:`~omnigent.superchat.rollover.roll_over_session` the threshold
+        and idle triggers run builds a real one instead. It runs in the
+        background (the summarizer outlives the server's forward timeout) and
+        publishes the in-progress / completed events the client expects;
+        returning 200 makes the server skip its own compaction.
+        """
+        from omnigent.superchat.rollover import roll_over_session
+
+        model = await _superside_chat_session_model(conv_id)
+        if model is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "superside_chat_compact_failed",
+                    "detail": "Could not resolve the session's model.",
+                },
+            )
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client, session_id=conv_id
+        )
+        wire, connection = _summarize_route(conv_id, model)
+        _publish_event(conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id})
+
+        async def _compact() -> None:
+            rolled_over = False
+            try:
+                rolled_over = await roll_over_session(
+                    conv_id,
+                    labels=labels,
+                    model=model,
+                    server_client=server_client,
+                    llm_client=_get_runner_llm_client(),
+                    connection=connection,
+                    wire=wire,
+                    on_rolled_over=lambda: _drop_superside_chat_warm_client(conv_id),
+                    on_stored=_journal_checkpoint(conv_id, labels),
+                    cause="manual",
+                )
+            except Exception:  # noqa: BLE001 — background task; the failed event clears the spinner
+                _logger.warning(
+                    "superside-chat /compact failed for %s",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+            outcome = "completed" if rolled_over else "failed"
+            _publish_event(conv_id, {"type": f"response.compaction.{outcome}", "task_id": conv_id})
+
+        task = asyncio.create_task(_compact(), name=f"superside-chat-compact-{conv_id}")
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        return Response(status_code=200)
+
     async def _handle_claude_sdk_compact(conv_id: str) -> Response:
         """Compact a claude-sdk session by sending it the ``/compact`` command.
 
@@ -7942,8 +8042,13 @@ def create_runner_app(
         ``/compact`` turn: buffered behind an in-flight turn (the harness has a
         single client), started immediately otherwise. Returns 200 so the
         Omnigent server treats the control as handled and skips its own
-        (transcript-only) compaction.
+        (transcript-only) compaction. A superside-chat session is compacted by
+        Omnigent instead (``_handle_superside_chat_compact``).
         """
+        if (await _rollover_labels_for_session(conv_id)).get(
+            CONTEXT_MODE_LABEL
+        ) == SUPERSIDE_CHAT_MODE_VALUE:
+            return await _handle_superside_chat_compact(conv_id)
         compact_body: _JsonObject = {
             "type": "message",
             "role": "user",
@@ -8485,6 +8590,8 @@ def create_runner_app(
             _sweep_dead_turn_slot(conv_id, target)
             return
         _interrupted_sessions.add(conv_id)
+        # The executor drops its client on an interrupt: the next turn starts cold.
+        _forget_superside_chat_prefix(conv_id)
         await _forward_harness_interrupt(conv_id)
         # Floor: force-cancel the runner Task when we own one. In stream mode
         # there is no Task here — ``_resync_turn_state`` owns the sentinel pop,
@@ -8869,6 +8976,7 @@ def create_runner_app(
         *,
         is_rewake: bool = False,
         check_archived_redirect: bool = False,
+        journal_result: tuple[str, str] | None = None,
     ) -> None:
         target_id = parent_id
         if check_archived_redirect:
@@ -8883,6 +8991,16 @@ def create_runner_app(
             _stranded_wake_parents.discard(parent_id)
             if is_rewake:
                 _last_rewake_notice[parent_id] = notice
+            elif journal_result is not None:
+                from omnigent.runner.memory.sync import record_helper_result
+
+                await record_helper_result(
+                    server_client,
+                    parent_id,
+                    title=journal_result[0],
+                    outcome=journal_result[1],
+                    session_id=child_id,
+                )
         else:
             _subagent_wake_pending.discard(parent_id)
             _stranded_wake_parents.add(parent_id)
@@ -8951,6 +9069,7 @@ def create_runner_app(
                 entry.created_by,
                 is_rewake=is_rewake,
                 check_archived_redirect=entry.superside_chat,
+                journal_result=(entry.title, entry.status) if entry.superside_chat else None,
             )
         )
         _wake_task.add_done_callback(_background_tasks.discard)
@@ -9260,18 +9379,24 @@ def create_runner_app(
         if defer_if_active and conv_id in _active_turns:
             _superside_chat_pending_refresh.add(conv_id)
             return
+        _forget_superside_chat_prefix(conv_id)
         _session_histories.pop(conv_id, None)
         if process_manager is not None:
             await process_manager.release(conv_id)
 
-    async def _superside_chat_at_hard_context_limit(conv_id: str) -> bool:
-        """Whether *conv_id*'s last known context fill leaves no room for another turn.
+    def _forget_superside_chat_prefix(conv_id: str) -> None:
+        """Forget what the warm client was sent: the next turn carries every block in full."""
+        _superside_chat_prefix_sent.pop(conv_id, None)
+        _superside_chat_prefix_pending.pop(conv_id, None)
+
+    async def _superside_chat_hard_limit_tokens(conv_id: str) -> int | None:
+        """The context fill of *conv_id* if it leaves no room for another turn, else ``None``.
 
         Uses the fill the last turn reported (recorded by
         ``_schedule_superside_chat_threshold_rollover``, else the session's
         ``last_context_tokens`` label) against the session's reported window.
-        ``False`` when either is unknown: the turn then dispatches without
-        waiting, since the rollover threshold sits well below the window.
+        ``None`` when either is unknown: the turn then dispatches as usual,
+        since the rollover threshold sits well below the window.
         """
         from omnigent.context.rollover import reported_context_tokens
         from omnigent.superchat.rollover import exceeds_hard_context_limit
@@ -9282,9 +9407,9 @@ def create_runner_app(
         tokens = _superside_chat_last_context_tokens.get(conv_id)
         if tokens is None:
             tokens = reported_context_tokens(labels)
-        return exceeds_hard_context_limit(labels, context_tokens=tokens)
+        return tokens if exceeds_hard_context_limit(labels, context_tokens=tokens) else None
 
-    async def _consume_superside_chat_pending_refresh(conv_id: str) -> None:
+    async def _consume_superside_chat_pending_refresh(conv_id: str) -> int | None:
         """Apply a deferred superside-chat warm-client drop at the start of a turn.
 
         Called unconditionally at the top of ``_run_turn_bg_setup_and_stream``
@@ -9293,41 +9418,58 @@ def create_runner_app(
         A rollover still in flight (a background task scheduled by
         ``_maybe_superside_chat_threshold_rollover``) is NOT waited on: the
         turn dispatches at once on the current state (the warm client, or a
-        cold replay of the full history — the checkpoint doesn't exist yet),
-        because the rollover threshold sits below the model's window, so one
-        more turn fits. If the rollover finishes while that turn is active,
-        its warm-client drop is deferred (``_drop_superside_chat_warm_client``)
-        and applied here on the turn after. The one exception is the hard
-        limit (``_superside_chat_at_hard_context_limit``): dispatching would
-        overflow the window, so the turn waits (bounded) for the rollover.
+        cold replay of the history since the checkpoint — the new one doesn't
+        exist yet), because the rollover threshold sits below the model's
+        window, so one more turn fits. If the rollover finishes while that
+        turn is active, its warm-client drop is deferred
+        (``_drop_superside_chat_warm_client``) and applied here on the turn
+        after.
 
-        Then, if a rollover deferred its drop because THIS session had an
+        At the hard limit (``_superside_chat_hard_limit_tokens``) another turn
+        on that state would overflow the window, whether a rollover is in
+        flight, failed or never started. The turn does not wait: the warm
+        client is dropped so it cold-starts from the record, a rollover is
+        scheduled if none is running (the summary catches up on a later turn),
+        and the caller loads only the newest whole turns after the checkpoint
+        that fit the returned budget. Nothing is deleted from the record.
+
+        Otherwise, if a rollover deferred its drop because THIS session had an
         active turn at the time, applies it now: this turn is the next one,
         so no turn is active yet.
+
+        :returns: The token budget for the turn's history after the
+            checkpoint at the hard limit, else ``None``.
         """
-        task = _superside_chat_rollover_tasks.get(conv_id)
-        if (
-            task is not None
-            and not task.done()
-            and await _superside_chat_at_hard_context_limit(conv_id)
-        ):
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(task), timeout=_SUPERSIDE_CHAT_ROLLOVER_WAIT_TIMEOUT_S
+        from omnigent.context.rollover import resolve_keep_tokens
+
+        keep_tokens: int | None = None
+        drop = conv_id in _superside_chat_pending_refresh
+        labels = await _rollover_labels_for_session(conv_id)
+        if labels.get(CONTEXT_MODE_LABEL) == SUPERSIDE_CHAT_MODE_VALUE:
+            tokens = await _superside_chat_hard_limit_tokens(conv_id)
+            if tokens is not None:
+                keep_tokens = resolve_keep_tokens(
+                    await _session_labels_for_runner_spawn(
+                        server_client=server_client, session_id=conv_id
+                    )
                 )
-            except TimeoutError:
                 _logger.warning(
-                    "superside-chat rollover still in flight after %.0fs for %s; "
-                    "proceeding without waiting further",
-                    _SUPERSIDE_CHAT_ROLLOVER_WAIT_TIMEOUT_S,
+                    "superside-chat context at the hard limit for %s; "
+                    "cold-starting from the checkpoint plus the newest whole turns",
                     conv_id,
                     extra={"session_id": conv_id},
                 )
-            except Exception:  # noqa: BLE001 — the rollover task logs its own failures
-                pass
-        if conv_id in _superside_chat_pending_refresh:
+                drop = True
+                pending = _superside_chat_rollover_tasks.get(conv_id)
+                model = await _superside_chat_session_model(conv_id)
+                if (pending is None or pending.done()) and model is not None:
+                    _schedule_superside_chat_threshold_rollover(
+                        conv_id, {"usage": {"context_tokens": tokens, "model": model}}
+                    )
+        if drop:
             _superside_chat_pending_refresh.discard(conv_id)
             await _drop_superside_chat_warm_client(conv_id, defer_if_active=False)
+        return keep_tokens
 
     def _schedule_superside_chat_threshold_rollover(
         conv_id: str, resp_response: _JsonObject
@@ -9395,8 +9537,10 @@ def create_runner_app(
         model = body.get("model_override") or body.get("llm_model")
         return model if isinstance(model, str) and model else None
 
-    async def _maybe_superside_chat_idle_rollover(conv_id: str) -> None:
-        """Roll over a superside-chat session on its first message back from idle.
+    async def _maybe_superside_chat_idle_rollover(
+        conv_id: str, *, measure_history: bool = True, trimmed: bool = False
+    ) -> float | None:
+        """Handle a superside-chat session's first message back from idle.
 
         Called every turn, at the top of ``_run_turn_bg_setup_and_stream``
         (before any history is loaded) — it decides for itself whether this
@@ -9405,24 +9549,53 @@ def create_runner_app(
         idle-seconds check, not from its call site. A no-op for a
         non-superside-chat session (checked before the idle lookup, so
         those pay no extra round trip).
+
+        A return is not context pressure, so it makes no summarizer call: the warm
+        client is dropped and the turn cold-starts from the stored checkpoint plus the
+        items since its anchor. The history is read here, once, and left cached for the
+        turn (the same read the turn would make). Only when those items alone exceed the
+        kept-tail budget (``resolve_keep_tokens``, counted as the tail is) does the
+        normal rollover run, with the "return" cause in its header.
+
+        :param measure_history: Whether this turn's history is read from the record
+            (not for a native harness, which keeps its own).
+        :param trimmed: The hard-limit path already trimmed this turn's history.
+        :returns: Seconds idle when this is a return, for the turn's gap line; else ``None``.
         """
         from omnigent.context.labels import is_superside_chat
+        from omnigent.context.rollover import resolve_keep_tokens
         from omnigent.superchat.rollover import roll_over_session, should_roll_over_for_idle
 
         labels = await _session_labels_for_runner_spawn(
             server_client=server_client, session_id=conv_id
         )
         if not is_superside_chat(labels):
-            return
+            return None
+        _schedule_memory_sync(conv_id, labels)
         idle_seconds = await _superside_chat_idle_seconds(conv_id)
         if not should_roll_over_for_idle(labels, idle_seconds=idle_seconds):
-            return
-        _logger.info("superside-chat refresh on return: %s idle %.0fs", conv_id, idle_seconds)
+            return None
+        _logger.info("superside-chat return from idle: %s idle %.0fs", conv_id, idle_seconds)
+        # defer_if_active=False: this runs synchronously at the start of
+        # THIS turn, which already holds its own _active_turns slot (claimed
+        # by the caller before this turn's task was even created) — the
+        # default deferral check would otherwise always (wrongly) defer.
+        await _drop_superside_chat_warm_client(conv_id, defer_if_active=False)
+        if not measure_history or trimmed:
+            return idle_seconds
+        since_anchor: list[int] = []
+        _session_histories[conv_id] = await _load_history_as_input(
+            conv_id, tail_tokens_out=since_anchor
+        )
+        keep_tokens = resolve_keep_tokens(labels)
+        if not since_anchor or since_anchor[0] <= keep_tokens:
+            return idle_seconds
+        # The turn's own read waits for the rollover; the cache is dropped with the client.
         # The turn body's ``model`` is the agent name; summarize on the session's LLM.
         # ROLLOVER_TOKEN_COUNT_MODEL (gpt-4o) is a tokenizer stand-in for sizing
         # text, never a model to actually call — falling back to it here would
         # silently route a real summarizer call to it. Skip this rollover
-        # instead; the next turn/idle check tries again.
+        # instead; the history read above is a valid cold start.
         resolved_model = await _superside_chat_session_model(conv_id)
         if resolved_model is None:
             _logger.warning(
@@ -9430,11 +9603,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            return
-        # defer_if_active=False: this runs synchronously at the start of
-        # THIS turn, which already holds its own _active_turns slot (claimed
-        # by the caller before this turn's task was even created) — the
-        # default deferral check would otherwise always (wrongly) defer.
+            return idle_seconds
         wire, connection = _summarize_route(conv_id, resolved_model)
         await roll_over_session(
             conv_id,
@@ -9447,7 +9616,10 @@ def create_runner_app(
             on_rolled_over=lambda: _drop_superside_chat_warm_client(
                 conv_id, defer_if_active=False
             ),
+            on_stored=_journal_checkpoint(conv_id, labels),
+            cause="return",
         )
+        return idle_seconds
 
     async def _maybe_superside_chat_threshold_rollover(
         conv_id: str,
@@ -9509,6 +9681,7 @@ def create_runner_app(
                 connection=connection,
                 wire=wire,
                 on_rolled_over=lambda: _drop_superside_chat_warm_client(conv_id),
+                on_stored=_journal_checkpoint(conv_id, labels),
             )
         except Exception:  # noqa: BLE001 — background task; never fail the turn that scheduled it
             _logger.warning(
@@ -9518,8 +9691,26 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
 
+    def _warm_client_serial(conv_id: str) -> str | None:
+        """The number of *conv_id*'s live harness subprocess, or ``None`` when unknown."""
+        serial = getattr(process_manager, "instance_serial", None)
+        value = serial(conv_id) if callable(serial) else None
+        return str(value) if isinstance(value, int) else None
+
+    def _commit_superside_chat_prefix(conv_id: str) -> None:
+        """Remember what the completed turn sent, tied to the subprocess that received it."""
+        sent = _superside_chat_prefix_pending.pop(conv_id, None)
+        serial = _warm_client_serial(conv_id)
+        if sent is not None and serial is not None:
+            _superside_chat_prefix_sent[conv_id] = {**sent, "process": serial}
+
     async def _apply_turn_prefix_blocks(
-        body: _JsonObject, conv_id: str, message: _JsonObject | None = None
+        body: _JsonObject,
+        conv_id: str,
+        message: _JsonObject | None = None,
+        *,
+        prompt_key: str = "",
+        idle_gap_seconds: float | None = None,
     ) -> _JsonObject:
         """Prepend the Super Chat per-turn blocks (Memory Profile, Projects, local time).
 
@@ -9529,10 +9720,35 @@ def create_runner_app(
         Called only for ``superside-chat`` turns; the blocks come from the one
         ``superchat.prompt_prefix`` hook, fetched fresh each turn (the SDK's system prompt is
         frozen per warm client, so a per-message block is the seam that still reaches it).
+
+        A warm client keeps every earlier turn's blocks in its transcript, so the Memory Profile
+        and Projects go in full only when they changed since this client last received them;
+        otherwise each is one short line. What it received is remembered only once a turn
+        completes (``_commit_superside_chat_prefix``), and only while the same subprocess
+        runs under the same *prompt_key* (a hash of the instructions and tool names the turn
+        sends: the executor rebuilds its client when they change, and replays the persisted
+        history, which holds no blocks). Taking the remembered state here means a turn that
+        fails, is interrupted or is cut short leaves nothing behind, so the next turn is full.
         """
         workspace = await _session_runtime_cwd(conv_id)
         texts = _message_texts(message.get("content")) if message else []
-        blocks = await turn_prefix_blocks(server_client, conv_id, workspace, texts)
+        last = _superside_chat_prefix_sent.pop(conv_id, None)
+        serial = _warm_client_serial(conv_id)
+        if last is not None and (
+            last.get("prompt") != prompt_key or last.get("process") != serial
+        ):
+            last = None
+        sent_now: dict[str, str] = {"prompt": prompt_key}
+        blocks = await turn_prefix_blocks(
+            server_client,
+            conv_id,
+            workspace,
+            texts,
+            idle_gap_seconds=idle_gap_seconds,
+            last_sent=last,
+            sent_now=sent_now,
+        )
+        _superside_chat_prefix_pending[conv_id] = sent_now
         return _prepend_turn_blocks(body, blocks, conv_id)
 
     def _discard_comment_relay(session_id: str, relay: ClaudeNativeToolRelay) -> None:
@@ -9851,9 +10067,10 @@ def create_runner_app(
         conv: str,
     ) -> None:
         # Cheap no-op for a session with no pending superside-chat rollover;
-        # otherwise waits out an in-flight one and applies a deferred
-        # warm-client drop before anything below touches the harness.
-        await _consume_superside_chat_pending_refresh(conv)
+        # otherwise applies a deferred warm-client drop before anything below
+        # touches the harness, and at the hard context limit returns the
+        # budget this turn's history is trimmed to.
+        _trim_keep_tokens = await _consume_superside_chat_pending_refresh(conv)
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         _prior_agent_id = _session_agent_ids.get(conv)
         if (
@@ -9951,11 +10168,25 @@ def create_runner_app(
 
         # Refresh on return: checked every turn (a live chat keeps its history
         # cached); a rollover drops the cache so the load below starts from it.
-        await _maybe_superside_chat_idle_rollover(conv)
+        _idle_gap = await _maybe_superside_chat_idle_rollover(
+            conv,
+            measure_history=not is_native_harness(harness_name),
+            trimmed=_trim_keep_tokens is not None,
+        )
         if conv not in _session_histories:
             _session_histories[conv] = (
-                [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
+                []
+                if is_native_harness(harness_name)
+                else await _load_history_as_input(conv, keep_tokens=_trim_keep_tokens)
             )
+            _history = _session_histories[conv]
+            if _trim_keep_tokens is not None and (
+                not _history or _history[-1].get("role") != "user"
+            ):
+                # The trimmed turn always ends with the person's latest message.
+                _history.append(
+                    {"type": "message", "role": "user", "content": msg_body.get("content", [])}
+                )
         _raw_per_request_instructions = cast(str | None, msg_body.get("instructions"))
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
@@ -10085,8 +10316,6 @@ def create_runner_app(
                 "content",
                 [],
             )
-        if _turn_context_mode == SUPERSIDE_CHAT_MODE_VALUE:
-            harness_body = await _apply_turn_prefix_blocks(harness_body, conv, msg_body)
         _content = cast(list[object], harness_body.get("content", []))
         _content_summary = []
         for _ci in _content:
@@ -10211,6 +10440,23 @@ def create_runner_app(
             and (name := _schema_tool_name(t)) is not None
             and name not in _spec_names
         )
+
+        if _turn_context_mode == SUPERSIDE_CHAT_MODE_VALUE:
+            # Placed after the tools are known: the key covers what the executor builds its
+            # system prompt from, so a change to it (which rebuilds the client) is a cold start.
+            _tool_names = sorted(
+                name for t in merged_tools if (name := _schema_tool_name(t)) is not None
+            )
+            _prompt_key = hashlib.sha256(
+                json.dumps([instructions, _tool_names]).encode()
+            ).hexdigest()
+            harness_body = await _apply_turn_prefix_blocks(
+                harness_body,
+                conv,
+                msg_body,
+                prompt_key=_prompt_key,
+                idle_gap_seconds=_idle_gap,
+            )
 
         await _ensure_native_terminal_for_turn(conv, harness_name)
 
@@ -10816,6 +11062,9 @@ def create_runner_app(
                                     # only for this one.
                                     _inj_id = event.get("injection_id")
                                     _answer_offer(_inj_id, taken=False)
+                                    # A refused steer can leave the client dropped (cold next).
+                                    _superside_chat_prefix_pending.pop(conv_id, None)
+                                    _superside_chat_prefix_sent.pop(conv_id, None)
                                     for _m in list(_session_message_buffers.get(conv_id) or []):
                                         if _m.get("injection_id") != _inj_id:
                                             continue
@@ -10845,6 +11094,7 @@ def create_runner_app(
                                             }
                                         )
                                         _text_acc.clear()
+                                    _commit_superside_chat_prefix(conv_id)
                                     _schedule_superside_chat_threshold_rollover(
                                         conv_id, event.get("response") or {}
                                     )
@@ -14228,6 +14478,7 @@ def create_runner_app(
         _session_mcp_spec_hash.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
+        _forget_superside_chat_prefix(session_id)
         if agent_id:
             _spec_cache.pop(agent_id, None)
 

@@ -47,6 +47,7 @@ tools:
     - "sys_os_*"
     - "memory_*"
     - session_history
+    - state_close
     - side_chat_open
     - open_project
     - start_helper
@@ -70,3 +71,5 @@ tools:
   # model (CONTEXT.md "Sub-agent Type").
   agents:
     - worker
+    # System-started only (daily-note passes): no Helper role, so start_helper never picks it.
+    - notes

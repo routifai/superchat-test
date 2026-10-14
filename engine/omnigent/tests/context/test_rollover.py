@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from omnigent.context.rollover import (
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.codex_native import main as codex_native
 from omnigent.llms.types import MessageOutput, OutputText, Response
+from omnigent.runner.memory.files import state_text_of
 from omnigent.runtime.compaction import count_tokens
 from omnigent.server.routes._sessions.common import (
     _LAST_CONTEXT_WINDOW_LABEL_KEY,
@@ -311,6 +313,38 @@ async def test_build_rollover_item_feeds_previous_summary_for_progressive_summar
     assert client.seen_messages is not None
     first_text = client.seen_messages[0]["content"][0]["text"]
     assert "automatically generated summary" in first_text
+
+
+@pytest.mark.asyncio
+async def test_rollover_marks_stale_open_entries_where_the_model_and_state_md_read() -> None:
+    today = datetime.now(UTC).date()
+    old, recent = today - timedelta(days=30), today - timedelta(days=29)
+    previous = f"{CHECKPOINT_HEADER}\n\n- [o-dana · {old} · stale?] waiting on Dana's reply"
+    # The summarizer keeps the mark it was shown and adds a 29-day-old and a closed entry.
+    client = _ReturnsTextClient(
+        f"- [o-dana · {old} · stale?] waiting on Dana's reply\n"
+        f"- [o-quotes · {recent}] three quotes requested\n"
+        f"- [t-venue · {old}] closed: the venue is booked"
+    )
+
+    data = await build_rollover_item(
+        _turn(1),
+        previous_summary=previous,
+        keep_tokens=_HUGE_TOKENS,
+        model="gpt-4o",
+        llm_client=client,
+    )
+
+    state = (
+        f"- [o-dana · {old} · stale?] waiting on Dana's reply\n"
+        f"- [o-quotes · {recent}] three quotes requested\n"
+        f"- [t-venue · {old}] closed: the venue is booked"
+    )
+    assert data.repairs == 0
+    assert data.summary == f"{CHECKPOINT_HEADER}\n\n{state}"
+    assert data.compacted_messages is not None
+    assert data.compacted_messages[1]["content"][0]["text"] == state
+    assert state_text_of(data.summary) == state  # what STATE.md is written from
 
 
 @pytest.mark.asyncio
@@ -1089,6 +1123,129 @@ def test_person_facing_summary_drops_framing_title_and_tool_sections(header_name
     )
 
 
+# ── checkpoint headers name their cause ──────────────────────────────────
+
+
+def test_each_checkpoint_cause_has_its_own_header_with_the_shared_marker() -> None:
+    from omnigent.context.rollover import CHECKPOINT_HEADERS, CHECKPOINT_MARKER, checkpoint_header
+
+    size, back, manual = (checkpoint_header(c) for c in ("size", "return", "manual"))
+
+    assert size == CHECKPOINT_HEADER  # the header stored before causes were named
+    assert len({size, back, manual}) == 3
+    assert "grew past its context limit" in size
+    assert "came back after a long break" in back
+    assert "asked to compact" in manual
+    assert "grew past its context limit" not in back + manual
+    assert (size, back, manual) == CHECKPOINT_HEADERS
+    for header in CHECKPOINT_HEADERS:
+        assert is_checkpoint_text(header) and header.startswith(CHECKPOINT_MARKER)
+        assert "session_history" in header  # the rest of the framing is shared
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", ["size", "return", "manual"])
+async def test_build_rollover_item_header_names_the_cause(cause: Any) -> None:
+    from omnigent.context.rollover import checkpoint_header
+
+    data = await build_rollover_item(
+        _turn(1) + _turn(2),
+        previous_summary=None,
+        keep_tokens=1,
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient("STATE"),
+        cause=cause,
+    )
+
+    assert data.summary == f"{checkpoint_header(cause)}\n\nSTATE"
+    assert data.compacted_messages is not None
+    assert data.compacted_messages[0]["content"][0]["text"] == checkpoint_header(cause)
+
+
+@pytest.mark.asyncio
+async def test_build_rollover_item_defaults_to_the_size_header() -> None:
+    data = await build_rollover_item(
+        _turn(1),
+        previous_summary=None,
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient("STATE"),
+    )
+    assert data.summary.startswith(CHECKPOINT_HEADER)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", ["size", "return", "manual"])
+async def test_a_later_rollover_strips_whatever_header_the_previous_one_had(cause: Any) -> None:
+    from omnigent.context.rollover import checkpoint_header
+
+    client = _ReturnsTextClient("NEXT")
+    await build_rollover_item(
+        _turn(2),
+        previous_summary=f"{checkpoint_header(cause)}\n\nOLD STATE",
+        model="gpt-4o",
+        llm_client=client,
+    )
+
+    prompt = str(client.seen_messages)
+    assert "OLD STATE" in prompt
+    assert "Context checkpoint inserted by the system" not in prompt
+
+
+@pytest.mark.parametrize("cause", ["size", "return", "manual"])
+def test_person_facing_summary_strips_every_cause_header(cause: Any) -> None:
+    from omnigent.context.rollover import checkpoint_header
+
+    assert person_facing_summary(f"{checkpoint_header(cause)}\n\nBody") == "Body"
+
+
+def test_the_reset_checkpoint_keeps_its_own_wording() -> None:
+    from omnigent.context.rollover import RESET_HEADER, build_reset_item
+
+    item = build_reset_item("a9", model=None)
+
+    assert item.summary == RESET_HEADER
+    assert "cleared this conversation" in RESET_HEADER
+    assert "grew past" not in RESET_HEADER
+    assert person_facing_summary(RESET_HEADER) is None
+
+
+@pytest.mark.parametrize("cause", ["size", "return", "manual"])
+def test_a_side_chat_seed_replaces_any_cause_header_with_its_own_framing(cause: Any) -> None:
+    """A parent checkpoint reused as a seed is reframed, whatever made it."""
+    from omnigent.context.rollover import (
+        SIDE_CHAT_SEED_HEADER,
+        _side_chat_framed,
+        checkpoint_header,
+    )
+    from omnigent.entities import CompactionData
+
+    header = checkpoint_header(cause)
+    seed = CompactionData(
+        summary=f"{header}\n\nSTATE",
+        last_item_id="a1",
+        model="gpt-4o",
+        token_count=5,
+        compacted_messages=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": header}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "STATE"}],
+            },
+        ],
+    )
+
+    data = _side_chat_framed(seed)
+
+    assert data.summary == f"{SIDE_CHAT_SEED_HEADER}\n\nSTATE"
+    assert data.compacted_messages is not None
+    assert data.compacted_messages[0]["content"][0]["text"] == SIDE_CHAT_SEED_HEADER
+
+
 def test_person_facing_summary_reads_a_seed_stored_before_the_marker_prefix() -> None:
     from omnigent.context.rollover import CHECKPOINT_MARKER, SIDE_CHAT_SEED_HEADER
 
@@ -1136,3 +1293,221 @@ def test_split_with_unknown_anchor_falls_back_to_after_the_checkpoint() -> None:
     items = [_split_item("u1"), ckpt, _split_item("u2")]
     after, _ = split_at_latest_compaction(items)
     assert [i["id"] for i in after] == ["u2"]
+
+
+@pytest.mark.asyncio
+async def test_summarizer_transcript_uses_the_shared_tool_digest() -> None:
+    """Tool items reach the summarizer as the framed one-line digest, not raw lines."""
+    from omnigent.context.tool_digest import RESULT_LIMIT, tool_digest_line
+
+    items = [
+        *_turn(1),
+        {
+            "id": "i-call",
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "files_write",
+            "arguments": '{"path": "projects/x/brief.md"}',
+        },
+        {"id": "i-out", "type": "function_call_output", "call_id": "c1", "output": "y" * 5_000},
+    ]
+    client = _ReturnsTextClient("ROLLING SUMMARY")
+    await build_rollover_item(
+        items, previous_summary=None, keep_tokens=_HUGE_TOKENS, model="gpt-4o", llm_client=client
+    )
+    assert client.seen_messages is not None
+    transcript = next(
+        block["text"]
+        for message in client.seen_messages
+        if message.get("role") == "user"
+        for block in message["content"]
+        if isinstance(block, dict) and "text" in block
+    )
+    digest = tool_digest_line("files_write", '{"path": "projects/x/brief.md"}', "y" * 5_000)
+    assert f"TOOL: {digest}" in transcript
+    assert "path=projects/x/brief.md" in digest
+    assert "y" * (RESULT_LIMIT + 1) not in transcript
+    assert "TOOL RESULT:" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_placeholder_previous_summary_is_not_fed_back_as_state() -> None:
+    """A harness's one-line compaction stand-in holds no state; it is not the previous summary."""
+    placeholder = "[Claude Code compaction — context was automatically compacted]"
+    client = _ReturnsTextClient("ROLLING SUMMARY")
+    await build_rollover_item(
+        _turn(1),
+        previous_summary=placeholder,
+        keep_tokens=_HUGE_TOKENS,
+        model="gpt-4o",
+        llm_client=client,
+    )
+    assert client.seen_messages is not None
+    texts = [
+        block["text"]
+        for message in client.seen_messages
+        if message.get("role") == "user"
+        for block in message["content"]
+        if isinstance(block, dict) and "text" in block
+    ]
+    assert placeholder not in texts[0]
+
+
+def test_is_placeholder_summary_only_matches_the_stand_in() -> None:
+    from omnigent.context.rollover import is_placeholder_summary
+
+    assert is_placeholder_summary("[Claude Code compaction — context was automatically compacted]")
+    assert not is_placeholder_summary(None)
+    assert not is_placeholder_summary("## Context checkpoint\n\nreal state")
+
+
+# ── tagged state file + journal ──────────────────────────────────────────
+
+_TAGGED_PREVIOUS = (
+    f"{CHECKPOINT_HEADER}\n\n## Topics\n"
+    "- [t-launch-budget · 2026-10-09] Spring launch budget: confirm the venue line\n"
+    "- [o-venue · 2026-10-09] Venue still open\n"
+    "Current position: waiting."
+)
+
+
+def test_summarizer_instruction_carries_the_tag_and_digest_rules() -> None:
+    text = state_file_summarizer_instruction(today="2026-01-01")
+    assert "Keep every existing tag exactly" in text
+    assert "closed:" in text and "merged into" in text
+    assert "no tags, give tags" in text
+    assert "A tool digest says what was done" in text
+    assert "never what the page, file or result said" in text
+    assert "<journal>" in text
+    assert "<journal>" not in state_file_summarizer_instruction(journal=False)
+
+
+@pytest.mark.asyncio
+async def test_the_journal_section_is_split_off_and_stored_on_the_item() -> None:
+    reply = (
+        "## Context checkpoint — 2026-10-12\n- [t-a] Alpha\n\n"
+        "<journal>\n- 2026-10-12 · asked for alpha\n- 2026-10-12 · wrote a file\n</journal>"
+    )
+    data = await build_rollover_item(
+        _turn(1) + _turn(2),
+        previous_summary=None,
+        keep_tokens=1,
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient(reply),
+    )
+    assert data.journal_lines == ["2026-10-12 · asked for alpha", "2026-10-12 · wrote a file"]
+    assert "journal" not in data.summary
+    assert all("journal" not in str(m) for m in data.compacted_messages)
+    assert "[t-a" in data.summary
+    assert data.repairs == 0 and data.evicted_entries == [] and data.applied_closes == []
+
+
+@pytest.mark.asyncio
+async def test_a_reply_without_a_journal_has_zero_lines() -> None:
+    data = await build_rollover_item(
+        _turn(1),
+        previous_summary=None,
+        keep_tokens=1,
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient("## State\n- [t-a] Alpha"),
+    )
+    assert data.journal_lines == []
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_loses_a_tag_is_repaired_and_counted() -> None:
+    reply = "## Topics\n- [t-launch-budget · 2026-10-12] Budget moved on\nCurrent position: x"
+    data = await build_rollover_item(
+        _turn(1),
+        previous_summary=_TAGGED_PREVIOUS,
+        keep_tokens=1,
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient(reply),
+    )
+    assert data.repairs == 1
+    assert "- [o-venue · 2026-10-09] Venue still open" in data.summary
+    assert "Budget moved on" in data.summary
+    restored = data.compacted_messages[1]["content"][0]["text"]
+    assert "- [o-venue · 2026-10-09] Venue still open" in restored
+
+
+@pytest.mark.asyncio
+async def test_an_untagged_previous_checkpoint_is_carried_over_without_repairs() -> None:
+    previous = (
+        f"{CHECKPOINT_HEADER}\n\n## Topics\nSpring launch budget: venue line\nCurrent position: x"
+    )
+    data = await build_rollover_item(
+        _turn(1),
+        previous_summary=previous,
+        keep_tokens=1,
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient("- [t-launch] Spring launch budget: venue line"),
+    )
+    assert data.repairs == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_closes_close_the_entry_and_reach_the_journal_lines() -> None:
+    data = await build_rollover_item(
+        _turn(1),
+        previous_summary=_TAGGED_PREVIOUS,
+        keep_tokens=1,
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient(
+            "- [t-launch-budget · 2026-10-09] Spring launch budget\n"
+            "<journal>\n2026-10-12 · talked\n</journal>"
+        ),
+        pending_closes={"o-venue": "the person said it is wrong"},
+    )
+    assert data.applied_closes == [{"tag": "o-venue", "reason": "the person said it is wrong"}]
+    assert "] closed: Venue still open" in data.summary
+    assert data.repairs == 0
+    assert data.journal_lines[0] == "2026-10-12 · talked"
+    assert data.journal_lines[-1].endswith("closed [o-venue]: the person said it is wrong")
+
+
+@pytest.mark.asyncio
+async def test_the_previous_state_fed_back_has_no_journal_and_no_header() -> None:
+    client = _ReturnsTextClient("- [t-a] A\n<journal>\n2026-10-12 · x\n</journal>")
+    first = await build_rollover_item(
+        _turn(1), previous_summary=None, keep_tokens=1, model="gpt-4o", llm_client=client
+    )
+    await build_rollover_item(
+        _turn(2), previous_summary=first.summary, keep_tokens=1, model="gpt-4o", llm_client=client
+    )
+    fed = client.seen_messages[0]["content"][0]["text"]
+    assert "- [t-a · " in fed
+    assert "2026-10-12 · x" not in fed
+
+
+def test_old_compaction_items_load_and_render() -> None:
+    from omnigent.entities import CompactionData
+    from omnigent.entities.conversation import parse_item_data
+
+    old = {
+        "summary": f"{CHECKPOINT_HEADER}\n\nOLD STATE FILE with no tags",
+        "last_item_id": "a1",
+        "model": "gpt-4o",
+        "token_count": 12,
+        "compacted_messages": [],
+    }
+    data = parse_item_data("compaction", old)
+    assert isinstance(data, CompactionData)
+    assert data.journal_lines is None and data.repairs is None
+    assert data.evicted_entries is None and data.applied_closes is None
+    assert person_facing_summary(data.summary) == "OLD STATE FILE with no tags"
+    # None fields stay out of the API shape, so old and new clients see old items unchanged.
+    assert "journal_lines" not in data.model_dump(exclude_none=True)
+
+
+def test_likely_duplicate_entries_are_pointed_out_to_the_summarizer() -> None:
+    from omnigent.context.rollover import _transcript_message
+
+    previous = (
+        "## Context checkpoint\n"
+        "- [t-venue · 2026-10-01] Venue for the spring launch: choosing between two halls\n"
+        "- [t-hall · 2026-10-05] Spring launch venue: choosing between two halls downtown\n"
+    )
+    text = str(_transcript_message([_msg("m1", "user", "hello")], previous))
+    assert "[t-venue] and [t-hall] may be the same thing" in text
+    assert text.index("may be the same thing") < text.index("<conversation>")

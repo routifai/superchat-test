@@ -68,6 +68,22 @@ def _isolated_model_catalog_store(
 
 
 @pytest.fixture(autouse=True)
+def _isolated_knowledge_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """Point the Computer's workspace (``memory/``, the index root) at a temp folder.
+
+    A stored checkpoint writes ``~/workspace/memory/`` in the runner; a test must never write
+    the developer's real home. ``memory/`` exists, so the rebuild that heals a missing folder
+    stays out of unrelated tests. The path is returned for tests that read the files.
+    """
+    workspace = tmp_path_factory.mktemp("knowledge_workspace")
+    (workspace / "memory").mkdir()
+    monkeypatch.setenv("SUPERCHAT_KNOWLEDGE_ROOT", str(workspace))
+    return workspace
+
+
+@pytest.fixture(autouse=True)
 def _ensure_subprocess_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     """Put the project root on ``PYTHONPATH`` for spawned harness children.
 
@@ -265,14 +281,24 @@ class _FakeProcessManager:
         # Every release call with its idle-cutoff guard, including calls the
         # guard suppressed; ``released`` records only completed releases.
         self.release_calls: list[tuple[str, float | None]] = []
+        # A new number for each (re)spawned subprocess, like the real manager's entries.
+        self._serials: dict[str, int] = {}
+        self._next_serial = 1
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
     ) -> _ScriptedHarnessClient:
         """Return the fixed scripted client."""
         self.get_client_calls.append((conversation_id, harness, env))
+        if conversation_id not in self._sessions:
+            self._serials[conversation_id] = self._next_serial
+            self._next_serial += 1
         self._sessions.add(conversation_id)
         return self._client
+
+    def instance_serial(self, conversation_id: str) -> int | None:
+        """The number of the live subprocess, or ``None`` without one."""
+        return self._serials.get(conversation_id) if conversation_id in self._sessions else None
 
     def has_session(self, conversation_id: str) -> bool:
         """Check if a session was registered via :meth:`get_client`."""

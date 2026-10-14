@@ -40,7 +40,7 @@ def test_pi_bundle_differs_from_default_only_in_harness_keys() -> None:
     ]
 
 
-HELPERS = ("worker", "worker/agents/subworker")
+HELPERS = ("worker", "worker/agents/subworker", "notes")
 PI_KEYS = ("context_files: false", "system_prompt_mode: replace", "skills: none")
 
 
@@ -92,7 +92,8 @@ def test_spec_loader_loads_both_bundles(
     # No model is named: a session runs on the model picked from its connection.
     assert spec.executor.model is None
     assert spec.executor.config["harness"] == harness
-    assert {a.name for a in spec.sub_agents} == {"worker"}
+    # ``notes`` is started by the engine for the daily-note passes, never by start_helper.
+    assert {a.name for a in spec.sub_agents} == {"worker", "notes"}
     worker = next(a for a in spec.sub_agents if a.name == "worker")
     for sub in [*spec.sub_agents, *worker.sub_agents]:
         assert sub.executor.config["harness"] == harness, sub.name
@@ -104,6 +105,8 @@ def test_spec_loader_loads_both_bundles(
             assert sub.executor.config["context_files"] is False, sub.name
             assert sub.executor.config["system_prompt_mode"] == "replace", sub.name
             assert sub.skills_filter == "none", sub.name
+
+
 @pytest.mark.parametrize("bundle", [CLAUDE, PI], ids=["claude", "pi"])
 def test_the_muse_may_call_its_reply_tools(bundle: Path) -> None:
     # A feature tool missing from the Muse's allow list is invisible to it.
@@ -112,3 +115,27 @@ def test_the_muse_may_call_its_reply_tools(bundle: Path) -> None:
         assert name in allow, name
     # Charts and dashboards are pages built in the Computer; the retired JSON chart tools stay out.
     assert not {"display_chart", "display_dashboard"} & allow
+
+
+@pytest.mark.parametrize("bundle", [CLAUDE, PI], ids=["claude", "pi"])
+def test_only_the_muse_may_close_a_working_list_line(bundle: Path) -> None:
+    def allowed(path: Path) -> set[str]:
+        return {line.strip().removeprefix("- ") for line in _lines(path)}
+
+    assert "state_close" in allowed(bundle / "config.yaml")
+    for helper in ("worker", "notes"):
+        names = allowed(bundle / "agents" / helper / "config.yaml")
+        assert "state_close" not in names
+    worker_names = allowed(bundle / "agents" / "worker" / "config.yaml")
+    # The worker reads memory/ with the file tools; it gains no tool that writes the notes.
+    assert not {"daily_note_update", "memory_remember", "memory_forget"} & worker_names
+
+
+@pytest.mark.parametrize("bundle", [CLAUDE, PI], ids=["claude", "pi"])
+def test_prompts_point_at_the_memory_folder(bundle: Path) -> None:
+    muse = (bundle / "AGENTS.md").read_text()
+    assert "search `memory/journal` with `files_query`" in muse
+    assert "`state_close`" in muse
+    assert "Never edit it or the journal" in muse
+    worker = (bundle / "agents/worker/config.yaml").read_text()
+    assert "`memory/STATE.md` holds" in worker and "Never write there" in worker
