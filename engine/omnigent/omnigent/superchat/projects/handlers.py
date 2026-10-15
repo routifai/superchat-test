@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
-import httpx
-
-from omnigent.superchat._handler_http import error
+from omnigent.superchat._handler_http import error, set_session_workspace
 from omnigent.superchat.feature import HandlerCtx
 from omnigent.superchat.projects.card import (
     CARD_FILE,
@@ -19,35 +18,15 @@ from omnigent.superchat.projects.card import (
 from omnigent.superchat.projects.choice import person_chose_workspace
 
 
-def _refusal_detail(resp: httpx.Response) -> str:
-    """The server's refusal message (``{"error": {"message": ...}}``), else the raw body."""
-    try:
-        err = resp.json().get("error")
-    except (ValueError, AttributeError):
-        err = None
-    detail = err.get("message") if isinstance(err, dict) else err
-    return str(detail or resp.text)[:300]
-
-
-async def _set_workspace(
-    ctx: HandlerCtx, path: str, project_name: str | None = None
-) -> str | None:
-    """Ask the server to move the session's working directory; an error message on failure."""
-    assert ctx.server_client is not None
-    body: dict[str, Any] = {"workspace": path}
-    if project_name:
-        body["project_name"] = project_name
-    try:
-        resp = await ctx.server_client.put(
-            f"/v1/sessions/{ctx.conversation_id}/workspace",
-            json=body,
-            timeout=30.0,
-        )
-    except httpx.HTTPError as exc:
-        return f"could not change the working directory: {exc}"
-    if resp.status_code >= 400:
-        return f"could not change the working directory: {_refusal_detail(resp)}"
-    return None
+def resolve_project(slug: str) -> tuple[Path, str] | None:
+    """The folder and card name of Project ``slug``, or ``None`` when it has no card."""
+    if not is_slug(slug):
+        return None
+    folder = projects_root() / slug
+    if not (folder / CARD_FILE).is_file():
+        return None
+    card = read_card(slug)
+    return folder, card.name if card else slug
 
 
 async def handle_open_project(ctx: HandlerCtx, args: dict[str, Any]) -> str:
@@ -70,18 +49,21 @@ async def handle_open_project(ctx: HandlerCtx, args: dict[str, Any]) -> str:
         )
     slug = args.get("slug")
     if slug is None:
-        failure = await _set_workspace(ctx, str(workspace_root()))
+        failure = await set_session_workspace(
+            ctx.server_client, ctx.conversation_id, str(workspace_root())
+        )
         if failure:
             return error(failure)
         return json.dumps({"opened": None, "path": str(workspace_root())})
     if not is_slug(slug):
         return error("open_project: 'slug' must be a folder name from the Projects list, or null")
-    folder = projects_root() / slug
-    if not (folder / CARD_FILE).is_file():
+    project = resolve_project(slug)
+    if project is None:
         return error(f"open_project: no Project '{slug}' (it has no {CARD_FILE})")
-    card = read_card(slug)
-    name = card.name if card else slug
-    failure = await _set_workspace(ctx, str(folder), name)
+    folder, name = project
+    failure = await set_session_workspace(
+        ctx.server_client, ctx.conversation_id, str(folder), name
+    )
     if failure:
         return error(failure)
     return json.dumps({"opened": slug, "name": name, "path": str(folder)})

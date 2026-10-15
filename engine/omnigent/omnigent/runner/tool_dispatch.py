@@ -47,6 +47,7 @@ from omnigent.superchat.feature import HandlerCtx, SpawnRequest, SpawnResult, Su
 from omnigent.superchat.features import FEATURE_HANDLERS, FEATURE_RELAY_OPS, notify_result
 from omnigent.superchat.prompt_prefix import fetch_memory_profile as _fetch_memory_profile_block
 from omnigent.superchat.subagents import (
+    WORKER_TYPE,
     count_live_children,
     prepend_memory_profile,
     refuse_subagent_concurrency,
@@ -2679,6 +2680,8 @@ def _sub_agent_host(
             publish_event=publish_event,
             session_inbox=session_inbox,
             labels=labels,
+            workspace=request.workspace,
+            project_name=request.project_name,
         )
         try:
             handle = json.loads(output)
@@ -2738,6 +2741,8 @@ async def _execute_subagent_tool(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
     labels: Mapping[str, str] | None = None,
+    workspace: str | None = None,
+    project_name: str | None = None,
 ) -> str:
     """
     Dispatch a sub-agent tool call (``sys_session_send``).
@@ -2769,6 +2774,9 @@ async def _execute_subagent_tool(
         caller is a superside-chat session, is forwarded (filtered to the
         inheritable set) so the child inherits the mode — see
         ``rollover/SUPERSIDE-CHAT-PLAN.md`` slice S3.
+    :param workspace: Absolute folder a newly created child works in, set before its first
+        message; ``None`` keeps the parent's current folder, which the child inherits at create.
+    :param project_name: Card name of the Project ``workspace`` is, if it is one.
     :returns: JSON child-session handle, or an error string.
     """
     # Lazy import to avoid circular dependency at module load.
@@ -2990,6 +2998,12 @@ async def _execute_subagent_tool(
                 f"{child_session_id}. Re-send without 'cost_budget' to "
                 "continue it, or sys_session_close it first to spawn a "
                 "fresh session with the requested budget."
+            )
+        if workspace is not None:
+            return (
+                f"Error: sys_session_send a working directory applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} title "
+                f"{session_name!r} already exists as {child_session_id}."
             )
         child_wrapper_label = _session_wrapper_label(existing)
         existing_work = _runner_app.get_subagent_work(child_session_id)
@@ -3324,6 +3338,22 @@ async def _execute_subagent_tool(
             return "Error: server did not return child session_id"
         child_wrapper_label = _session_wrapper_label(child_data)
         created_child = True
+
+        if workspace is not None:
+            # Moved before anything is registered or posted, so the first turn already works
+            # there; a refusal deletes the child. Pi and claude-sdk keep their spawn-time cwd,
+            # harmless while their native file tools are off: re-enabling them needs a respawn.
+            from omnigent.superchat._handler_http import set_session_workspace
+
+            failure = await set_session_workspace(
+                server_client, child_session_id, workspace, project_name
+            )
+            if failure is not None:
+                teardown_warning = await _teardown_failed_child(
+                    server_client, child_session_id, created_child=True
+                )
+                error = f"Error: {failure}"
+                return f"{error}\n{teardown_warning}" if teardown_warning else error
 
         # Attach a subagent_cost_budget policy to the child when requested.
         # Non-fatal: the child session is still usable without the budget.
@@ -5179,6 +5209,12 @@ async def _execute_scheduled_task_tool(
         # "self" binds the task to the calling session.
         if args.get("parent_session_id") == "self":
             args["parent_session_id"] = conversation_id
+        # A chat that names no agent schedules for itself: bind to this chat as a worker.
+        if tool_name == "sys_scheduled_task_create":
+            if not args.get("agent_id") and not args.get("parent_session_id"):
+                args["parent_session_id"] = conversation_id
+            if args.get("parent_session_id") and not args.get("agent_type"):
+                args["agent_type"] = WORKER_TYPE
 
     try:
         if tool_name == "sys_scheduled_task_list":

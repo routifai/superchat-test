@@ -8,6 +8,7 @@ profile means "no profile".
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from collections.abc import Mapping, Sequence
@@ -15,14 +16,25 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.superchat.local_time import local_time_block
-from omnigent.superchat.projects.block import projects_block
+from omnigent.memory.service import PROFILE_BLOCK_FOOTER, PROFILE_BLOCK_HEADER
+from omnigent.superchat.artifacts.writeback import NOTE_LINE as EDIT_NOTE_LINE
+from omnigent.superchat.knowledge.attachment_context import OPEN as ATTACHMENT_OPEN
+from omnigent.superchat.knowledge.attachment_context import REMINDER as ATTACHMENT_REMINDER
+from omnigent.superchat.local_time import LOCAL_TIME_OPEN, fetch_timezone, local_time_block
+from omnigent.superchat.projects.block import PROJECTS_OPEN, projects_block
+from omnigent.superchat.projects.choice import MOVED_NOTE
+from omnigent.superchat.recall_hint.hint import FOOTER as HINT_FOOTER
+from omnigent.superchat.recall_hint.hint import HEADER as HINT_HEADER
+from omnigent.superchat.recall_hint.hint import recall_hint_block
 
 _logger = logging.getLogger(__name__)
 
 #: Sent in place of a block the warm client already holds, see :func:`turn_prefix_blocks`.
 PROFILE_UNCHANGED_LINE = "Standing memory unchanged since the last message."
 PROJECTS_UNCHANGED_LINE = "Projects unchanged since the last message."
+
+
+IDLE_GAP_OPEN, IDLE_GAP_CLOSE = "It has been ", " since the last message."
 
 
 def idle_gap_line(idle_seconds: float) -> str:
@@ -35,7 +47,7 @@ def idle_gap_line(idle_seconds: float) -> str:
         span = f"{hours} hour" + ("" if hours == 1 else "s")
     else:
         span = "less than an hour"
-    return f"It has been {span} since the last message."
+    return f"{IDLE_GAP_OPEN}{span}{IDLE_GAP_CLOSE}"
 
 
 def _delta_block(
@@ -94,15 +106,7 @@ async def fetch_memory_profile(
 
 async def fetch_local_time_line(server_client: httpx.AsyncClient | None) -> str:
     """The person's current local date/time line (owner preference zone; UTC when unknown)."""
-    timezone: str | None = None
-    try:
-        if server_client is not None:
-            resp = await server_client.get("/v1/me/proactivity", timeout=10.0)
-            if resp.status_code == 200:
-                timezone = resp.json().get("timezone")
-    except (httpx.HTTPError, ValueError, AttributeError):
-        pass
-    return local_time_block(timezone)
+    return local_time_block(await fetch_timezone(server_client))
 
 
 def _safe_projects_block(workspace: Path | None) -> str | None:
@@ -172,13 +176,15 @@ async def turn_prefix_blocks(
     idle_gap_seconds: float | None = None,
     last_sent: Mapping[str, str] | None = None,
     sent_now: dict[str, str] | None = None,
+    recall: bool = False,
 ) -> list[str]:
     """The blocks to prepend to a Super Chat turn, in application order.
 
     Each block is prepended in turn, so the last one ends up first: ``[message blocks (the files
-    it attaches), memory profile (when any), Projects (when any), feature notes such as hand
-    edits (when any), local time]`` renders as local time, then the feature notes, then the
-    Projects, then the profile, then the message blocks, then the person's message.
+    it attaches), recall hint (when any), memory profile (when any), Projects (when any), feature
+    notes such as hand edits (when any), local time]`` renders as local time, then the feature
+    notes, then the Projects, then the profile, then the recall hint, then the message blocks,
+    then the person's message.
 
     :param workspace: The session's current working directory (marks the open Project).
     :param message_texts: Text parts of the turn's own message; features build blocks from them
@@ -190,10 +196,20 @@ async def turn_prefix_blocks(
         ``None`` (a cold start, or anything unproven) sends every block in full.
     :param sent_now: Filled with the hashes of the profile and Projects blocks this turn
         carries, for the caller to remember once the turn completes.
+    :param recall: Whether this chat may get the recall hint (the owner's setting decides, see
+        :mod:`omnigent.superchat.recall_hint`). It is built alongside the other fetches.
     """
+    hint = (
+        asyncio.create_task(
+            recall_hint_block(server_client, conversation_id, workspace, message_texts)
+        )
+        if recall and message_texts
+        else None
+    )
     blocks: list[str] = []
     if message_texts:
         blocks.extend(await _message_prefix_blocks(server_client, conversation_id, message_texts))
+    hint_at = len(blocks)
     profile = await fetch_memory_profile(server_client, conversation_id)
     if profile:
         blocks.append(
@@ -207,4 +223,55 @@ async def turn_prefix_blocks(
     if idle_gap_seconds is not None:
         blocks.append(idle_gap_line(idle_gap_seconds))
     blocks.append(await fetch_local_time_line(server_client))
+    if hint is not None and (recalled := await hint):
+        blocks.insert(hint_at, recalled)
     return blocks
+
+
+#: The blocks that span lines, as (how one starts, what ends it). Projects end at the ``]`` that
+#: closes the block, the one followed by the blank line before the next block.
+_FENCED_BLOCKS = (
+    (PROFILE_BLOCK_HEADER, PROFILE_BLOCK_FOOTER),
+    (HINT_HEADER, "\n" + HINT_FOOTER),
+    (ATTACHMENT_OPEN, ATTACHMENT_REMINDER),
+    (PROJECTS_OPEN, "]\n\n"),
+)
+_MOVED_OPEN, _MOVED_CLOSE = MOVED_NOTE.split("{}")
+
+
+def _injected_line(line: str) -> bool:
+    """Whether *line* is one of the one-line blocks :func:`turn_prefix_blocks` writes."""
+    line = line.strip()
+    return (
+        (line.startswith(LOCAL_TIME_OPEN) and line.endswith("]"))
+        # The attachment block's closing line is left alone by the transcript's own cut of the
+        # block (:func:`omnigent.context.attachments.strip_legacy_attachment_context`).
+        or line in (PROFILE_UNCHANGED_LINE, PROJECTS_UNCHANGED_LINE, ATTACHMENT_REMINDER)
+        or (line.startswith(IDLE_GAP_OPEN) and line.endswith(IDLE_GAP_CLOSE))
+        or (line.startswith(_MOVED_OPEN) and line.endswith(_MOVED_CLOSE))
+        or EDIT_NOTE_LINE.fullmatch(line) is not None
+    )
+
+
+def person_words(text: str) -> str:
+    """*text* without the blocks :func:`turn_prefix_blocks` put in front of it: the person's words.
+
+    The blocks go to the harness only, but a harness that keeps its own transcript can hand the
+    prefixed message back, and a new Helper's Brief carries the Memory Profile. A reader that
+    wants what the person said (the ``conversation`` index) cuts them here, by the markers their
+    producers write. Only a leading run of blocks is cut, so the person's own text is never
+    touched; a block that never ends was cut off with nothing after it, so nothing is left.
+    """
+    rest = text.lstrip()
+    while rest:
+        for opener, closer in _FENCED_BLOCKS:
+            if rest.startswith(opener):
+                end = rest.find(closer, len(opener))
+                rest = "" if end < 0 else rest[end + len(closer) :].lstrip()
+                break
+        else:
+            line, _, after = rest.partition("\n")
+            if not _injected_line(line):
+                return rest.rstrip()
+            rest = after.lstrip()
+    return ""

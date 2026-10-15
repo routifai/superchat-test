@@ -199,6 +199,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.superchat.feature import is_helper
 from omnigent.superchat.helpers.saved_files import (
     collect_saved_files,
     forget_saved_files,
@@ -7943,20 +7944,35 @@ def create_runner_app(
 
     def _journal_checkpoint(
         conv_id: str, labels: Mapping[str, str] | None
-    ) -> Callable[[CompactionData], Awaitable[None]]:
-        """The ``on_stored`` hook for ``roll_over_session``: copy the checkpoint to ``memory/``."""
-        from omnigent.runner.memory.sync import record_checkpoint
+    ) -> Callable[[CompactionData, list[dict[str, Any]]], Awaitable[None]]:
+        """The ``on_stored`` hook for ``roll_over_session``: copy the checkpoint to ``memory/``,
+        then index the turns it retired (the ``conversation`` source)."""
+        from omnigent.runner.memory.sync import index_retired_turns, record_checkpoint
+        from omnigent.superchat.projects.card import project_slug_from_workspace
 
-        async def _record(item: CompactionData) -> None:
+        async def _record(item: CompactionData, window: list[dict[str, Any]]) -> None:
             await record_checkpoint(server_client, conv_id, dict(labels or {}), item)
+            workspace = await _session_workspace_value(conv_id)
+            await index_retired_turns(
+                server_client,
+                conv_id,
+                dict(labels or {}),
+                window,
+                project=project_slug_from_workspace(workspace) or "",
+            )
 
         return _record
 
     _memory_rebuilds: set[str] = set()
 
     def _schedule_memory_sync(conv_id: str, labels: Mapping[str, str] | None) -> None:
-        """Heal ``memory/`` in the background: missing folder, new owner, a reset not yet seen."""
-        from omnigent.runner.memory.sync import reconcile
+        """Heal ``memory/`` in the background: missing folder, new owner, a reset not yet seen.
+
+        Then a bounded step of indexing the Conversation's turns from before they were indexed
+        at compaction, and the last turns of its archived Side chats and Forks (the
+        ``conversation`` source).
+        """
+        from omnigent.runner.memory.sync import backfill_turns, index_archived_chats, reconcile
 
         if _memory_rebuilds:
             return
@@ -7965,6 +7981,8 @@ def create_runner_app(
         async def _run() -> None:
             try:
                 await reconcile(server_client, conv_id, dict(labels or {}))
+                await backfill_turns(server_client, conv_id, dict(labels or {}))
+                await index_archived_chats(server_client, conv_id, dict(labels or {}))
             finally:
                 _memory_rebuilds.discard(conv_id)
 
@@ -9747,6 +9765,8 @@ def create_runner_app(
             idle_gap_seconds=idle_gap_seconds,
             last_sent=last,
             sent_now=sent_now,
+            # The person's own chats only; a Helper's Brief is its context.
+            recall=not is_helper(await _tool_labels_for_session(conv_id)),
         )
         _superside_chat_prefix_pending[conv_id] = sent_now
         return _prepend_turn_blocks(body, blocks, conv_id)

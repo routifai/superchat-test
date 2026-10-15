@@ -22,6 +22,7 @@ from omnigent.context.labels import (
     SCHEDULED_HELPER_LABEL_KEY,
     is_rollover,
 )
+from omnigent.context.refs import format_refs, refs_from_items
 from omnigent.context.state_file import (
     close_journal_line,
     likely_duplicates,
@@ -258,8 +259,11 @@ def state_file_summarizer_instruction(*, today: str | None = None, journal: bool
         "session_history. Never list tool names, function names or other "
         "internal system names (no 'technical capabilities' sections): the "
         "person may read this summary. "
-        "Write each task, decision and open loop as one line that starts with a tag, "
-        "'- [t-short-name · YYYY-MM-DD] text' (t- topic, d- decision, o- open loop). "
+        "Write each task, decision, open loop and preference as one line that starts with a "
+        "tag, '- [t-short-name · YYYY-MM-DD] text' (t- topic, d- decision, o- open loop, "
+        "p- preference: how the person wants things done, a standing rule). Only these four "
+        "kinds. One entry per preference; never write the same rule as both a decision and a "
+        "preference. "
         "Keep every existing tag exactly. Give each new entry a new short unique tag. "
         "Keep an entry short. Set the date to today on an entry you change or that came up "
         "since the prior checkpoint, and leave the others. Never delete an entry: "
@@ -508,13 +512,21 @@ def is_placeholder_summary(summary: str | None) -> bool:
     )
 
 
+def _turn_refs_line(turn: list[dict[str, Any]]) -> list[str]:
+    """``["REFS: files:a.md project:q3"]`` for one turn's items, or ``[]`` when it touched none."""
+    text = format_refs(refs_from_items(turn))
+    return [f"REFS: {text}"] if text else []
+
+
 def _transcript_message(
     items: list[dict[str, Any]], previous_summary: str | None
 ) -> dict[str, Any]:
     """Render the window as one transcript message for the summarizer.
 
     Sent as live chat turns, a weak model continues the conversation instead
-    of summarizing it; as quoted text it can only be summarized.
+    of summarizing it; as quoted text it can only be summarized. Each turn
+    that touched files, artifacts, a Project, Helpers or chats ends with a
+    ``REFS:`` line written by code, so the journal names the same objects.
     """
     lines: list[str] = []
     if previous_summary:
@@ -531,12 +543,17 @@ def _transcript_message(
             lines.append("")
     lines.append("<conversation>")
     digests = digest_tool_items(items)
+    turn_start = 0
     for index, item in enumerate(items):
+        if item.get("type") == "message" and item.get("role", "user") == "user" and index:
+            lines += _turn_refs_line(items[turn_start:index])
+            turn_start = index
         if index in digests:
             lines.append(f"TOOL: {digests[index]}")
         elif item.get("type") == "message":
             role = str(item.get("role", "user")).upper()
             lines.append(f"{role}: {_block_text(item.get('content'))}")
+    lines += _turn_refs_line(items[turn_start:])
     lines += [
         "</conversation>",
         "",
@@ -619,7 +636,8 @@ async def build_rollover_item(
         checkpoint; applied to the state file by code (see ``context/state_file.py``).
     :returns: A new :class:`CompactionData` ready to be posted as a
         ``compaction`` item. Besides the summary it carries the journal lines the summarizer
-        wrote, the entries evicted for the size budget, the closes applied and the repairs made.
+        wrote, the refs of the whole window (code-written, put on every journal line), the
+        entries evicted for the size budget, the closes applied and the repairs made.
     :raises ValueError: If *items_since_previous_compaction* is empty.
     """
     if not items_since_previous_compaction:
@@ -676,6 +694,7 @@ async def build_rollover_item(
         token_count=count_tokens(compacted_messages, model),
         compacted_messages=compacted_messages,
         journal_lines=journal_lines,
+        journal_refs=refs_from_items(items_since_previous_compaction) or None,
         evicted_entries=reconciled.evicted,
         applied_closes=reconciled.applied_closes,
         repairs=reconciled.repairs,

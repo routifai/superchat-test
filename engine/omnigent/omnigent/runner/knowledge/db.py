@@ -8,6 +8,13 @@ Layout (all in ``<home>/.superchat/knowledge/index.sqlite3``, on the Computer's 
 * ``chunks_fts``: an FTS5 table over the passages (BM25), kept in step with ``chunks``.
 * ``chunks_vec``: a sqlite-vec ``vec0`` table of their embeddings (cosine), created when the first
   vector arrives, rebuilt when the embedding model changes.
+* ``turns``: the ``conversation`` source, one passage per completed turn of the person's chats. A
+  chat keeps one row in ``files`` (kind ``turn``, path ``conversation/<chat id>``) that owns its
+  passages, so they share the FTS and vector tables and the embedding pass; such a row is never a
+  file (left out of :meth:`KnowledgeDb.files`, the pending counts and file searches).
+* ``refs``: the references a passage carries (``files``, ``artifacts``, ``project``, ``helpers``,
+  ``chats``; see :mod:`omnigent.runner.knowledge.refs`), from a journal line's trailing comment
+  or a turn's tool calls, so a search can filter on them.
 
 ``search`` fuses the two rankings with reciprocal rank fusion, or returns BM25 alone when the
 caller
@@ -22,9 +29,9 @@ import sqlite3
 import struct
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +43,10 @@ STATE_READY = "ready"
 STATE_FAILED = "failed"
 #: States the worker still has work for.
 PENDING_STATES = (STATE_QUEUED, STATE_TEXT_READY)
+
+#: Kind of a chat's row in ``files`` and of its passages: the ``conversation`` source.
+KIND_TURN = "turn"
+CONVERSATION = "conversation"
 
 EMBED_EMBEDDED = "embedded"
 EMBED_KEYWORD = "keyword"
@@ -82,6 +93,26 @@ CREATE TABLE IF NOT EXISTS chunks (
     embed_tag TEXT
 );
 CREATE INDEX IF NOT EXISTS chunks_file ON chunks (file_id, page_start, ord);
+CREATE TABLE IF NOT EXISTS turns (
+    chunk_id INTEGER PRIMARY KEY REFERENCES chunks (id) ON DELETE CASCADE,
+    turn_item_id TEXT NOT NULL UNIQUE,
+    chat_id TEXT NOT NULL,
+    main_id TEXT NOT NULL,
+    date TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    project TEXT NOT NULL DEFAULT '',
+    person_text TEXT NOT NULL DEFAULT '',
+    last_item_id TEXT NOT NULL DEFAULT '',
+    at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS turns_main ON turns (main_id);
+CREATE TABLE IF NOT EXISTS refs (
+    chunk_id INTEGER NOT NULL REFERENCES chunks (id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (chunk_id, key, value)
+);
+CREATE INDEX IF NOT EXISTS refs_value ON refs (key, value);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     body, tokenize = 'unicode61 remove_diacritics 2'
 );
@@ -116,6 +147,11 @@ def file_id_for(path: str) -> str:
     return hashlib.sha256(path.encode()).hexdigest()[:32]
 
 
+def turn_path(chat_id: str) -> str:
+    """The ``files`` path of a chat's conversation passages (never a workspace file)."""
+    return f"{CONVERSATION}/{chat_id}"
+
+
 def search_text(heading_path: str, text: str) -> str:
     """What BM25 and the embedding see for a passage: its headings, then its text."""
     if heading_path and not text.startswith(heading_path.rsplit(" > ", 1)[-1]):
@@ -141,6 +177,19 @@ def fts_query(query: str) -> str | None:
         stem = word[:-1] if len(word) > _PREFIX_MIN and word.endswith("s") else word
         parts.append(f'"{stem}"*' if len(stem) >= _PREFIX_MIN else f'"{word}"')
     return " OR ".join(parts) or None
+
+
+def fuse(lists: Sequence[Sequence[Hashable]]) -> list[tuple[Any, float]]:
+    """Reciprocal rank fusion: every item of *lists*, best first, with a score in ``[0, 1]`` (an
+    item on top of every list is 1). An item found by several lists rises above one found once.
+    """
+    ranks: dict[Any, float] = {}
+    best = len(lists) / (_RRF_K + 1)
+    for ids in lists:
+        for rank, item in enumerate(ids, start=1):
+            ranks[item] = ranks.get(item, 0.0) + 1.0 / (_RRF_K + rank)
+    ordered = sorted(ranks.items(), key=lambda pair: (-pair[1], pair[0]))
+    return [(item, score / best) for item, score in ordered]
 
 
 def vector_bytes(vector: Sequence[float]) -> bytes:
@@ -187,6 +236,39 @@ class ChunkRow:
     text: str
     embed_tag: str | None
 
+
+@dataclass(frozen=True)
+class TurnPassage:
+    """One completed turn of a chat, as the ``conversation`` source stores it.
+
+    :param chat_id: The chat (main Conversation, Side chat or Fork) the turn ran in.
+    :param turn_item_id: The person's message item id (what ``session_history`` reads).
+    :param date: The turn's date, ``YYYY-MM-DD``.
+    :param origin: ``main``, ``side`` or ``fork``.
+    :param project: The Project folder the turn ran in, or empty.
+    :param person_text: The person's words, clipped (hint snippets quote only these).
+    :param text: The passage: the person's text, the final reply and the tool digests.
+    :param main_id: The main Conversation of the chat (deleting it removes the chat's passages).
+    :param refs: The turn's references, ``{"files": [...], "artifacts": [...], ...}``.
+    :param last_item_id: The turn's last item (a runtime notice's turn after it counts as its
+        own), so a checkpoint anchor finds the turn it ends.
+    :param at: When the turn started (epoch seconds; 0 unknown): orders a chat's turns.
+    """
+
+    chat_id: str
+    turn_item_id: str
+    date: str
+    origin: str
+    project: str
+    person_text: str
+    text: str
+    main_id: str
+    refs: Mapping[str, Sequence[str]] = field(default_factory=dict)
+    last_item_id: str = ""
+    at: float = 0.0
+
+
+_TURN_FIELDS = ("chat_id", "turn_item_id", "date", "origin", "project", "person_text")
 
 _FILE_COLUMNS = (
     "file_id, path, name, kind, size, mtime_ns, explicit, state, embed_status, "
@@ -244,6 +326,12 @@ class KnowledgeDb:
             # changed since (see ``indexer.PARSER_VERSIONS``) is read again.
             conn.execute("ALTER TABLE files ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 1")
         conn.execute("CREATE INDEX IF NOT EXISTS files_sha256 ON files (sha256)")
+        turns = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
+        if "last_item_id" not in turns:
+            # Passages stored before have neither: the next write of the turn fills them in.
+            conn.execute("ALTER TABLE turns ADD COLUMN last_item_id TEXT NOT NULL DEFAULT ''")
+        if "at" not in turns:
+            conn.execute("ALTER TABLE turns ADD COLUMN at REAL NOT NULL DEFAULT 0")
 
     # ------------------------------------------------------------------ plumbing
 
@@ -334,10 +422,13 @@ class KnowledgeDb:
         """One file by its workspace-relative path."""
         return self.get_file(file_id_for(path))
 
-    def files(self) -> list[FileRow]:
-        """Every file, by path."""
+    def files(self, *, turns: bool = False) -> list[FileRow]:
+        """Every file, by path. The chats' rows of conversation passages only with *turns*."""
+        where = "" if turns else f"WHERE kind != '{KIND_TURN}' "
         with self._connection() as conn:
-            rows = conn.execute(f"SELECT {_FILE_COLUMNS} FROM files ORDER BY path").fetchall()
+            rows = conn.execute(
+                f"SELECT {_FILE_COLUMNS} FROM files {where}ORDER BY path"
+            ).fetchall()
         return [_file(r) for r in rows]
 
     def upsert_file(
@@ -412,7 +503,9 @@ class KnowledgeDb:
         with self._connection() as conn:
             return int(
                 conn.execute(
-                    f"SELECT COUNT(*) FROM files WHERE state IN ({marks})", PENDING_STATES
+                    f"SELECT COUNT(*) FROM files WHERE state IN ({marks}) "
+                    f"AND kind != '{KIND_TURN}'",
+                    PENDING_STATES,
                 ).fetchone()[0]
             )
 
@@ -421,22 +514,232 @@ class KnowledgeDb:
         marks = ", ".join("?" for _ in PENDING_STATES)
         with self._connection() as conn:
             rows = conn.execute(
-                f"SELECT name FROM files WHERE state IN ({marks}) ORDER BY path LIMIT ?",
+                f"SELECT name FROM files WHERE state IN ({marks}) AND kind != '{KIND_TURN}' "
+                "ORDER BY path LIMIT ?",
                 (*PENDING_STATES, limit),
             ).fetchall()
         return [str(r[0]) for r in rows]
+
+    # ------------------------------------------------------------------ conversation passages
+
+    def index_turns(
+        self, passages: Iterable[TurnPassage], *, cursor: tuple[str, str] | None = None
+    ) -> int:
+        """Store turn passages, keyword-searchable at once; idempotent on ``turn_item_id``.
+
+        A turn already stored with the same text is left as it is (an empty project, and its
+        last item and start, are filled in); one whose text changed (stored before its reply
+        was) is replaced. The chat's row goes back to ``text_ready`` so the background pass
+        embeds what is new. *cursor* is a ``(meta key, value)`` saved in the same transaction
+        (backfill progress).
+
+        :returns: How many passages were written.
+        """
+        written: set[str] = set()
+        count = 0
+        now = time.time()
+        with self._tx() as conn:
+            for p in passages:
+                old = conn.execute(
+                    "SELECT t.chunk_id, c.text, t.project, t.last_item_id, t.at FROM turns t "
+                    "JOIN chunks c ON c.id = t.chunk_id WHERE t.turn_item_id = ?",
+                    (p.turn_item_id,),
+                ).fetchone()
+                if old is not None and old[1] == p.text:
+                    if p.last_item_id and (old[3], old[4]) != (p.last_item_id, p.at):
+                        conn.execute(
+                            "UPDATE turns SET last_item_id = ?, at = ? WHERE chunk_id = ?",
+                            (p.last_item_id, p.at, old[0]),
+                        )
+                    if p.project and not old[2]:
+                        conn.execute(
+                            "UPDATE turns SET project = ? WHERE chunk_id = ?", (p.project, old[0])
+                        )
+                        self._write_refs(conn, old[0], {"project": [p.project]})
+                    continue
+                if old is not None:
+                    self._drop_chunk_ids(conn, [old[0]])
+                fid = file_id_for(turn_path(p.chat_id))
+                conn.execute(
+                    "INSERT INTO files (file_id, path, name, kind, state, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (file_id) DO NOTHING",
+                    (fid, turn_path(p.chat_id), p.chat_id, KIND_TURN, STATE_TEXT_READY, now),
+                )
+                ord_ = conn.execute(
+                    "SELECT COALESCE(MAX(ord), -1) + 1 FROM chunks WHERE file_id = ?", (fid,)
+                ).fetchone()[0]
+                chunk_id = conn.execute(
+                    "INSERT INTO chunks (file_id, ord, page_start, page_end, kind, heading_path, "
+                    "text) VALUES (?, ?, 1, 1, ?, '', ?)",
+                    (fid, ord_, KIND_TURN, p.text),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO chunks_fts (rowid, body) VALUES (?, ?)", (chunk_id, p.text)
+                )
+                project = p.project or (old[2] if old is not None else "")
+                conn.execute(
+                    "INSERT INTO turns (chunk_id, turn_item_id, chat_id, main_id, date, origin, "
+                    "project, person_text, last_item_id, at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        chunk_id,
+                        p.turn_item_id,
+                        p.chat_id,
+                        p.main_id,
+                        p.date,
+                        p.origin,
+                        project,
+                        p.person_text,
+                        p.last_item_id,
+                        p.at,
+                    ),
+                )
+                self._write_refs(
+                    conn, chunk_id, {**p.refs, "project": [project] if project else []}
+                )
+                written.add(fid)
+                count += 1
+            for fid in written:
+                conn.execute(
+                    "UPDATE files SET state = ?, attempts = 0, next_attempt_at = 0, "
+                    "last_error = NULL, updated_at = ?, "
+                    "chunk_count = (SELECT COUNT(*) FROM chunks WHERE file_id = ?) "
+                    "WHERE file_id = ?",
+                    (STATE_TEXT_READY, now, fid, fid),
+                )
+            if cursor is not None:
+                self._set_meta(conn, *cursor)
+        return count
+
+    def turn_meta(self, chunk_ids: Sequence[int]) -> dict[int, dict[str, str]]:
+        """``chunk id -> {chat_id, turn_item_id, date, origin, project, person_text}``."""
+        if not chunk_ids:
+            return {}
+        marks = ", ".join("?" for _ in chunk_ids)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT chunk_id, {', '.join(_TURN_FIELDS)} FROM turns "
+                f"WHERE chunk_id IN ({marks})",
+                list(chunk_ids),
+            ).fetchall()
+        return {r[0]: dict(zip(_TURN_FIELDS, r[1:], strict=True)) for r in rows}
+
+    def turn_chunks(self, turn_item_ids: Sequence[str]) -> dict[str, int]:
+        """``turn item id -> chunk id`` of the stored turns among *turn_item_ids*."""
+        if not turn_item_ids:
+            return {}
+        marks = ", ".join("?" for _ in turn_item_ids)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT turn_item_id, chunk_id FROM turns WHERE turn_item_id IN ({marks})",
+                list(turn_item_ids),
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def turn_ending(self, chat_id: str, item_id: str) -> int | None:
+        """The chunk id of *chat_id*'s stored turn that starts or ends at *item_id*, if any."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT chunk_id FROM turns WHERE chat_id = ? AND (last_item_id = ? OR "
+                "turn_item_id = ?) ORDER BY chunk_id DESC LIMIT 1",
+                (chat_id, item_id, item_id),
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    def turn_order(self, chunk_ids: Sequence[int]) -> dict[int, tuple[str, float, int]]:
+        """``chunk id -> (date, start, chunk id)``: sorts a chat's turns in the order they ran (a
+        passage stored without its start falls back to its day, then the order it was stored)."""
+        if not chunk_ids:
+            return {}
+        marks = ", ".join("?" for _ in chunk_ids)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT chunk_id, date, at FROM turns WHERE chunk_id IN ({marks})",
+                list(chunk_ids),
+            ).fetchall()
+        return {r[0]: (str(r[1]), float(r[2] or 0), int(r[0])) for r in rows}
+
+    def chats_of(self, main_id: str) -> list[str]:
+        """The chats with passages that belong to the main Conversation *main_id*."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT chat_id FROM turns WHERE main_id = ? ORDER BY chat_id", (main_id,)
+            ).fetchall()
+        return [str(r[0]) for r in rows]
+
+    # ------------------------------------------------------------------ references
+
+    @staticmethod
+    def _write_refs(
+        conn: sqlite3.Connection, chunk_id: int, refs: Mapping[str, Sequence[str]]
+    ) -> None:
+        conn.executemany(
+            "INSERT OR IGNORE INTO refs (chunk_id, key, value) VALUES (?, ?, ?)",
+            [(chunk_id, key, value) for key, values in refs.items() for value in values],
+        )
+
+    def set_refs(self, refs: Mapping[int, Mapping[str, Sequence[str]]]) -> None:
+        """Store passages' references: ``chunk id -> {key: [values]}``."""
+        with self._tx() as conn:
+            for chunk_id, found in refs.items():
+                self._write_refs(conn, chunk_id, found)
+
+    def refs_of(self, chunk_ids: Sequence[int]) -> dict[int, dict[str, list[str]]]:
+        """``chunk id -> {key: [values]}`` for the passages that carry references."""
+        if not chunk_ids:
+            return {}
+        marks = ", ".join("?" for _ in chunk_ids)
+        out: dict[int, dict[str, list[str]]] = {}
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT chunk_id, key, value FROM refs WHERE chunk_id IN ({marks}) "
+                "ORDER BY rowid",
+                list(chunk_ids),
+            ).fetchall()
+        for chunk_id, key, value in rows:
+            out.setdefault(chunk_id, {}).setdefault(key, []).append(value)
+        return out
+
+    def chunks_with_ref(self, key: str, value: str) -> set[int]:
+        """The passages that carry the reference ``key:value``."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT chunk_id FROM refs WHERE key = ? AND value = ?", (key, value)
+            ).fetchall()
+        return {r[0] for r in rows}
+
+    def delete_chats(self, chat_ids: Iterable[str], *, meta_keys: Sequence[str] = ()) -> int:
+        """Remove every passage of these chats, and the meta keys *meta_keys* (their progress).
+
+        :returns: How many passages were removed.
+        """
+        removed = 0
+        with self._tx() as conn:
+            for chat_id in dict.fromkeys(chat_ids):
+                fid = file_id_for(turn_path(chat_id))
+                removed += conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE file_id = ?", (fid,)
+                ).fetchone()[0]
+                self._delete_chunks(conn, fid)
+                conn.execute("DELETE FROM files WHERE file_id = ?", (fid,))
+            for key in meta_keys:
+                self._set_meta(conn, key, None)
+        return removed
 
     # ------------------------------------------------------------------ passages
 
     def _delete_chunks(self, conn: sqlite3.Connection, file_id: str) -> None:
         ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE file_id = ?", (file_id,))]
+        self._drop_chunk_ids(conn, ids)
+
+    def _drop_chunk_ids(self, conn: sqlite3.Connection, ids: Sequence[int]) -> None:
         if not ids:
             return
         marks = ", ".join("?" for _ in ids)
-        conn.execute(f"DELETE FROM chunks_fts WHERE rowid IN ({marks})", ids)
+        conn.execute(f"DELETE FROM chunks_fts WHERE rowid IN ({marks})", list(ids))
         if self._has_vec_table(conn) and self.vectors_supported:
-            conn.execute(f"DELETE FROM chunks_vec WHERE rowid IN ({marks})", ids)
-        conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
+            conn.execute(f"DELETE FROM chunks_vec WHERE rowid IN ({marks})", list(ids))
+        conn.execute(f"DELETE FROM chunks WHERE id IN ({marks})", list(ids))
 
     @staticmethod
     def _has_vec_table(conn: sqlite3.Connection) -> bool:
@@ -546,39 +849,57 @@ class KnowledgeDb:
         file_ids: Sequence[str] | None = None,
         query_vector: Sequence[float] | None = None,
         keyword: bool = True,
+        turns: bool = False,
     ) -> list[tuple[ChunkRow, float]]:
         """Best passages, best first, with a score in ``[0, 1]`` (the top hit of a list is 1).
 
         With *query_vector* the BM25 and vector rankings are fused (reciprocal rank fusion);
         without it BM25 alone ranks; ``keyword=False`` with a vector ranks by vector alone.
-        *file_ids* restricts the search to those files.
+        *file_ids* restricts the search to those files. Conversation passages are searched only
+        with ``turns=True`` (and then nothing else): a file search never returns one.
         """
+        lists = self.rankings(
+            query,
+            limit=limit,
+            file_ids=file_ids,
+            query_vector=query_vector,
+            keyword=keyword,
+            turns=turns,
+        )
+        ordered = fuse(lists)[:limit]
+        chunks = self.chunks_by_ids([chunk_id for chunk_id, _ in ordered])
+        return [(chunks[i], score) for i, score in ordered if i in chunks]
+
+    def rankings(
+        self,
+        query: str,
+        *,
+        limit: int,
+        file_ids: Sequence[str] | None = None,
+        query_vector: Sequence[float] | None = None,
+        keyword: bool = True,
+        turns: bool = False,
+    ) -> list[list[int]]:
+        """The BM25 and vector rankings of passage ids for *query*, before :func:`fuse` (see
+        :meth:`search`)."""
         wanted = set(file_ids) if file_ids is not None else None
         if wanted is not None and not wanted:
             return []
         candidates = max(limit * _CANDIDATE_FACTOR, _MIN_CANDIDATES)
-        ranks: dict[int, float] = {}
-        best = 0.0
-        lists: list[list[int]] = [self._bm25(query, candidates, wanted)] if keyword else []
+        lists: list[list[int]] = [self._bm25(query, candidates, wanted, turns)] if keyword else []
         if query_vector is not None and self.vector_dims() == len(query_vector):
-            lists.append(self._nearest(query_vector, candidates, wanted))
-        for ids in lists:
-            best += 1.0 / (_RRF_K + 1)
-            for rank, chunk_id in enumerate(ids, start=1):
-                ranks[chunk_id] = ranks.get(chunk_id, 0.0) + 1.0 / (_RRF_K + rank)
-        ordered = sorted(ranks.items(), key=lambda item: (-item[1], item[0]))[:limit]
-        chunks = self._chunks_by_ids([chunk_id for chunk_id, _ in ordered])
-        return [(chunks[i], score / best) for i, score in ordered if i in chunks]
+            lists.append(self._nearest(query_vector, candidates, wanted, turns))
+        return lists
 
-    def _bm25(self, query: str, limit: int, wanted: set[str] | None) -> list[int]:
+    def _bm25(self, query: str, limit: int, wanted: set[str] | None, turns: bool) -> list[int]:
         match = fts_query(query)
         if match is None:
             return []
         sql = (
             "SELECT chunks_fts.rowid FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
-            "WHERE chunks_fts MATCH ?"
+            f"WHERE chunks_fts MATCH ? AND c.kind {'=' if turns else '!='} ?"
         )
-        params: list[Any] = [match]
+        params: list[Any] = [match, KIND_TURN]
         if wanted is not None:
             sql += f" AND c.file_id IN ({', '.join('?' for _ in wanted)})"
             params.extend(sorted(wanted))
@@ -590,33 +911,37 @@ class KnowledgeDb:
             except sqlite3.OperationalError:
                 return []
 
-    def _nearest(self, vector: Sequence[float], limit: int, wanted: set[str] | None) -> list[int]:
+    def _nearest(
+        self, vector: Sequence[float], limit: int, wanted: set[str] | None, turns: bool
+    ) -> list[int]:
         if not self.vectors_supported:
             return []
         with self._connection() as conn:
             if not self._has_vec_table(conn):
                 return []
-            # vec0 has no row filter: ask for more neighbours when only some files count.
-            k = limit if wanted is None else min(limit * 8, 4096)
+            # vec0 has no row filter: ask for more neighbours, then keep the ones that count
+            # (file passages or conversation passages, and only *wanted* files).
+            k = min(limit * 8, 4096)
             rows = conn.execute(
                 "SELECT rowid FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
                 (vector_bytes(vector), k),
             ).fetchall()
             ids = [r[0] for r in rows]
-            if wanted is None or not ids:
+            if not ids:
                 return ids
             marks = ", ".join("?" for _ in ids)
-            keep = {
-                r[0]
-                for r in conn.execute(
-                    f"SELECT id FROM chunks WHERE id IN ({marks}) "
-                    f"AND file_id IN ({', '.join('?' for _ in wanted)})",
-                    (*ids, *sorted(wanted)),
-                )
-            }
+            sql = (
+                f"SELECT id FROM chunks WHERE id IN ({marks}) AND kind {'=' if turns else '!='} ?"
+            )
+            params: list[Any] = [*ids, KIND_TURN]
+            if wanted is not None:
+                sql += f" AND file_id IN ({', '.join('?' for _ in wanted)})"
+                params.extend(sorted(wanted))
+            keep = {r[0] for r in conn.execute(sql, params)}
         return [i for i in ids if i in keep][:limit]
 
-    def _chunks_by_ids(self, ids: Sequence[int]) -> dict[int, ChunkRow]:
+    def chunks_by_ids(self, ids: Sequence[int]) -> dict[int, ChunkRow]:
+        """Passages by id."""
         if not ids:
             return {}
         marks = ", ".join("?" for _ in ids)
